@@ -1,6 +1,7 @@
 import json
 import time
 from collections import Counter
+from pathlib import Path
 
 import pytest
 
@@ -37,6 +38,16 @@ def test_prepare_payload_rejects_output_cap_above_limit(tmp_path, field):
 
     with pytest.raises(ValueError, match=field):
         prepare_payload(path)
+
+
+def test_sample_request_does_not_send_unsupported_reasoning_effort():
+    sample_path = Path(__file__).resolve().parents[1] / "examples" / "tool_call_ab_request.json"
+    sample = json.loads(sample_path.read_text(encoding="utf-8"))
+
+    # NanoGPT rejected this field for xiaomi/mimo-v2.6-flash in a live request.
+    # Keep the diagnostic focused on tool-call SSE; model reasoning stays at its default.
+    assert "reasoning_effort" not in sample
+    assert sample["tool_choice"] == "required"
 
 
 def test_summarize_delta_records_only_safe_metadata():
@@ -77,7 +88,6 @@ def test_summarize_delta_records_only_safe_metadata():
     assert result["usage"]["total_tokens"] == 17
     assert secret not in repr(result)
     assert "private reasoning" not in repr(result)
-
 
 
 def test_default_nanogpt_base_matches_documented_api_origin():
