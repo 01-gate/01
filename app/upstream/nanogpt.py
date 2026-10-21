@@ -63,7 +63,7 @@ class UpstreamMeta:
     usage_seen: bool = False
     upstream_status: int | None = None
     duration_ms: int = 0
-    response_open_ms: int = 0
+    response_open_ms: int | None = None
     first_event_ms: int | None = None
     first_text_ms: int | None = None
     max_event_gap_ms: int = 0
