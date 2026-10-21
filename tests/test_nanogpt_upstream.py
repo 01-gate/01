@@ -119,6 +119,36 @@ class FakeUpstream:
                 }
             )
             chunks = list(STREAM_CHUNKS)
+            if self.mode == "tool_stream":
+                chunks = [
+                    json.dumps(
+                        {
+                            "id": "chatcmpl-up-1",
+                            "object": "chat.completion.chunk",
+                            "created": 1729500000,
+                            "model": "xiaomi/mimo-v2.6-flash",
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {
+                                        "tool_calls": [
+                                            {
+                                                "index": 0,
+                                                "id": "call_1",
+                                                "type": "function",
+                                                "function": {
+                                                    "name": "read_file",
+                                                    "arguments": "{\\"path\\":",
+                                                },
+                                            }
+                                        ]
+                                    },
+                                    "finish_reason": None,
+                                }
+                            ],
+                        }
+                    )
+                ]
             if self.mode == "stream_no_usage":
                 chunks = [json.loads(c) for c in chunks]
                 for c in chunks:
@@ -262,6 +292,84 @@ def test_sync_proxied_with_separate_ids(fake, caplog):
     assert "upstream_request_id=req_HEADER" in line
     assert "billing_lookup_id=req_PRICE" in line
     assert fake.requests[0]["path"] == "/v1/chat/completions"
+
+
+def test_tool_calling_fields_forwarded_to_upstream(fake):
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read a file",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"],
+                },
+            },
+        }
+    ]
+    messages = [
+        {"role": "user", "content": "Read README.md"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": "{\\"path\\":\\"README.md\\"}",
+                    },
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "contents"},
+    ]
+    r = _chat(
+        model="01",
+        messages=messages,
+        tools=tools,
+        tool_choice="auto",
+        parallel_tool_calls=False,
+    )
+    assert r.status_code == 200
+    sent = fake.requests[-1]["payload"]
+    assert sent["tools"] == tools
+    assert sent["tool_choice"] == "auto"
+    assert sent["parallel_tool_calls"] is False
+    assert sent["messages"] == messages
+
+
+def test_stream_tool_call_delta_is_preserved(fake):
+    fake.mode = "tool_stream"
+    r = _chat(
+        model="01",
+        messages=[{"role": "user", "content": "Read README.md"}],
+        stream=True,
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+                },
+            }
+        ],
+    )
+    assert r.status_code == 200
+    events = [line[6:] for line in r.text.splitlines() if line.startswith("data: ")]
+    chunks = [json.loads(event) for event in events if event != "[DONE]"]
+    tool_chunks = [
+        call
+        for chunk in chunks
+        for choice in chunk.get("choices", [])
+        for call in choice.get("delta", {}).get("tool_calls", [])
+    ]
+    assert tool_chunks
+    assert tool_chunks[0]["function"]["name"] == "read_file"
+    assert events[-1] == "[DONE]"
 
 
 def test_usage_base_url_never_used(fake):
