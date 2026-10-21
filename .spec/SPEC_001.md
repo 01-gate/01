@@ -1,4 +1,4 @@
-# SPEC-01: Локальный FastAPI-приёмник запросов OpenCode
+# Локальный FastAPI-приёмник запросов OpenCode
 
 **Версия:** 0.1  
 **Статус:** Ready for implementation  

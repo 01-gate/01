@@ -230,6 +230,10 @@ async def chat_completions(request: Request):
             except nanogpt.UpstreamError as err:
                 # статус уже отправлен: обрываем поток честно, без повторов (§6, §7)
                 error = err.kind
+            except Exception as exc:
+                # неожиданный сбой после отправки статуса: фиксируем в логе,
+                # а не выдаём за штатное завершение (SPEC_006 §2)
+                error = type(exc).__name__
             finally:
                 logger.info(nano_log, *base_args, *meta_args("200", error or "-"))
 

@@ -100,6 +100,10 @@ def _classify(exc: Exception) -> UpstreamError:
     # ConnectTimeout — таймаут, а не ошибка соединения: 504, не 502 (SPEC_005 §4.4)
     if isinstance(exc, httpx.TimeoutException):
         return UpstreamError("timeout", detail=type(exc).__name__)
+    # обрыв/невалидный протокол происходит при живом соединении — это protocol,
+    # а не connect (SPEC_006 §3: не подменять диагностику предположениями)
+    if isinstance(exc, httpx.RemoteProtocolError):
+        return UpstreamError("protocol", detail=type(exc).__name__)
     if isinstance(exc, httpx.HTTPError):
         return UpstreamError("connect", detail=type(exc).__name__)
     return UpstreamError("protocol", detail=type(exc).__name__)
@@ -153,16 +157,19 @@ async def run_chat(
         )
         response = await client.send(request, stream=True)
     except httpx.HTTPError as exc:
+        meta.duration_ms = int((time.monotonic() - started) * 1000)
         err = _classify(exc)
         meta.error = err.kind
         await client.aclose()
         raise err from None
     except Exception as exc:
         # неожиданный сбой до ответа клиенту: типизированная 502/504 (§4.4)
+        meta.duration_ms = int((time.monotonic() - started) * 1000)
         err = _classify(exc)
         meta.error = err.kind
         await client.aclose()
         raise err from None
+    meta.duration_ms = int((time.monotonic() - started) * 1000)
     if response.status_code >= 400:
         await _discard_error_body(response)
         meta.upstream_status = response.status_code
@@ -199,6 +206,7 @@ async def _sync(
     try:
         resp = await client.post("/chat/completions", json=payload, headers=_upstream_headers())
     except httpx.HTTPError as exc:
+        meta.duration_ms = int((time.monotonic() - started) * 1000)
         err = _classify(exc)
         meta.error = err.kind
         raise err from None
@@ -263,7 +271,6 @@ async def _stream(
                 data = json.dumps(chunk, ensure_ascii=False)
             meta.events += 1
             yield data
-        meta.duration_ms = int((time.monotonic() - started) * 1000)
         if not meta.usage_seen and payload.get("stream"):
             meta.extra["usage"] = "missing"
     except UpstreamError:
@@ -280,5 +287,7 @@ async def _stream(
         meta.error = err.kind
         raise err from None
     finally:
+        # длительность фиксируется при любом исходе: обрыв не должен маскироваться нулём
+        meta.duration_ms = int((time.monotonic() - started) * 1000)
         await response.aclose()
         await client.aclose()

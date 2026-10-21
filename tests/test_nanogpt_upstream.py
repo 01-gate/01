@@ -495,11 +495,17 @@ def test_upstream_http_error_normalized(fake, capfd):
     assert "SECRET_UPSTREAM_RAW_BODY" not in captured.out + captured.err
 
 
-def test_connect_error_maps_to_502(monkeypatch):
+def test_connect_error_maps_to_502(monkeypatch, caplog):
+    caplog.set_level(logging.INFO, logger="gateway")
     _patch_transport(monkeypatch, httpx.ConnectError("refused"))
     r = _chat(model="01", messages=[{"role": "user", "content": "hi"}])
     assert r.status_code == 502
     assert r.json()["error"]["code"] == "upstream_unavailable"
+    # SPEC_006 §5: ошибочный исход логируется с фактической длительностью
+    # (мгновенный отказ честно даёт duration_ms=0 — быть ненулевой он обязан
+    # только при реальной задержке, что проверяет тест 613)
+    line = [l for l in caplog.messages if l.startswith("chat method=POST")][-1]
+    assert "error=connect" in line
 
 
 def test_timeout_maps_to_504_without_retry(monkeypatch):
@@ -536,6 +542,9 @@ def test_classify_all_timeout_types_and_connect_error():
     ):
         assert nanogpt._classify(exc).kind == "timeout", type(exc).__name__
     assert nanogpt._classify(httpx.ConnectError("refused")).kind == "connect"
+    # SPEC_006: обрыв протокола при живом соединении — protocol, не connect
+    broken = httpx.RemoteProtocolError("peer closed connection")
+    assert nanogpt._classify(broken).kind == "protocol"
 
 
 @pytest.mark.parametrize(
@@ -582,12 +591,26 @@ def test_stream_upstream_error_before_body_is_gateway_error(fake, bad_status):
     assert len(fake.requests) == 1  # второй запрос ради предпроверки не открывался
 
 
-def test_stream_connect_error_before_body_returns_502(monkeypatch):
+def test_stream_connect_error_before_body_returns_502(monkeypatch, caplog):
     # §4.5.3: ошибка соединения до ответа — 502, не 200 с пустым потоком
-    _patch_transport(monkeypatch, httpx.ConnectError("refused"))
+    caplog.set_level(logging.INFO, logger="gateway")
+
+    class SlowFail(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request):
+            await asyncio.sleep(0.05)  # задержка, чтобы длительность была реальной
+            raise httpx.ConnectError("refused")
+
+    def factory():
+        return httpx.AsyncClient(
+            transport=SlowFail(), base_url=NANO_BASE
+        )
+
+    monkeypatch.setattr(nanogpt, "_client", factory)
     r = _stream_chat()
     assert r.status_code == 502
     assert r.json()["error"]["code"] == "upstream_unavailable"
+    line = [l for l in caplog.messages if l.startswith("chat method=POST")][-1]
+    assert "duration_ms=0" not in line  # SPEC_006 §5: диагностика не подменена нулём
 
 
 def test_stream_connect_timeout_before_body_returns_504(monkeypatch):
@@ -673,6 +696,45 @@ def test_stream_error_after_start_ends_without_fake_done(monkeypatch, caplog):
     assert "[DONE]" not in got  # поток обрывается честно, без подделки
     line = [l for l in caplog.messages if l.startswith("chat method=POST")][-1]
     assert not line.rstrip().endswith("error=-")  # состояние зафиксировано в логе
+    # SPEC_006 §1/§3: HTTP-статус первоначальный, результат потока отделён как ошибка
+    assert "status=200" in line
+    assert "upstream_status=200" in line
+    assert "error=-" not in line
+    # §5: длительность обрыва не подменена нулём
+    assert "duration_ms=0" not in line
+
+
+def test_stream_normal_final_log_separates_states(fake, caplog):
+    # SPEC_006 §2/§3: штатный поток — успех отличим от ошибки, статусы разделены
+    caplog.set_level(logging.INFO, logger="gateway")
+    got = _first_stream_data()
+    assert got[-1][1] == "[DONE]"
+    line = [l for l in caplog.messages if l.startswith("chat method=POST")][-1]
+    assert "status=200" in line
+    assert "upstream_status=200" in line
+    assert "events=2" in line
+    assert line.rstrip().endswith("error=-")
+
+
+def test_unexpected_exception_after_start_logged_as_error(monkeypatch, caplog):
+    # SPEC_006 §2: сбой не-типа UpstreamError после начала передачи
+    # не выдаётся за штатное завершение, [DONE] не подделывается
+    caplog.set_level(logging.INFO, logger="gateway")
+
+    async def run_chat(*args, **kwargs):
+        async def gen():
+            yield json.dumps({"id": "c1", "object": "x"})
+            raise ValueError("boom-internal")
+
+        return gen()
+
+    monkeypatch.setattr(nanogpt, "run_chat", run_chat)
+    r = _stream_chat()
+    assert r.status_code == 200  # заголовки уже отправлены, менять нельзя
+    line = [l for l in caplog.messages if l.startswith("chat method=POST")][-1]
+    assert "error=ValueError" in line
+    assert "error=-" not in line
+    assert "[DONE]" not in r.text  # завершение не подделано
 
 
 def test_malformed_upstream_response(fake):
