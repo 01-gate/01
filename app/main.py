@@ -86,8 +86,14 @@ def _upstream_error(err: nanogpt.UpstreamError) -> JSONResponse:
 
 
 @app.get("/health")
-async def health():
-    return JSONResponse({"status": "ok"})
+async def health(request: Request):
+    # Keep the public health contract minimal. A valid gateway key additionally
+    # gets the configured upstream mode so diagnostics can refuse stub-mode runs.
+    body = {"status": "ok"}
+    _, auth_ok = _auth(request)
+    if auth_ok:
+        body["upstream_mode"] = _upstream_mode()
+    return JSONResponse(body)
 
 
 @app.get("/v1/models")
@@ -238,7 +244,10 @@ async def chat_completions(request: Request):
 
         if not stream:
             logger.info(nano_log, *base_args, *meta_args("200", "-"))
-            return JSONResponse(result)
+            headers = {}
+            if meta.upstream_request_id:
+                headers["X-Upstream-Request-ID"] = meta.upstream_request_id
+            return JSONResponse(result, headers=headers)
 
         async def sse_nano() -> Any:
             error: str | None = None
@@ -256,10 +265,13 @@ async def chat_completions(request: Request):
             finally:
                 logger.info(nano_log, *base_args, *meta_args("200", error or "-"))
 
+        response_headers = {"Cache-Control": "no-cache", "Connection": "keep-alive"}
+        if meta.upstream_request_id:
+            response_headers["X-Upstream-Request-ID"] = meta.upstream_request_id
         return StreamingResponse(
             sse_nano(),
             media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+            headers=response_headers,
         )
 
     # legacy stub-режим: прежний интерфейс и поведение (§2.11)
