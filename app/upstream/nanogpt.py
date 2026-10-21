@@ -314,8 +314,12 @@ async def _stream(
                     delta = choice.get("delta", {})
                     if not isinstance(delta, dict):
                         continue
-                    for key, value in delta.items():
-                        meta.delta_key_counts[key] = meta.delta_key_counts.get(key, 0) + 1
+                    for key in delta:
+                        # Delta keys are metadata too: bound and sanitize them before logging.
+                        safe_key = "".join(
+                            c for c in str(key)[:40] if c.isalnum() or c in "_-."
+                        ) or "other"
+                        meta.delta_key_counts[safe_key] = meta.delta_key_counts.get(safe_key, 0) + 1
                     content = delta.get("content")
                     if meta.first_text_ms is None and isinstance(content, str) and content:
                         meta.first_text_ms = elapsed_ms
