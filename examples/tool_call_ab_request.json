@@ -27,6 +27,5 @@
     }
   ],
   "tool_choice": "required",
-  "reasoning_effort": "low",
   "max_completion_tokens": 512
 }
