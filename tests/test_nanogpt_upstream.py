@@ -279,6 +279,7 @@ def test_sync_proxied_with_separate_ids(fake, caplog):
     caplog.set_level(logging.INFO, logger="gateway")
     r = _chat(model="01", messages=[{"role": "user", "content": "hi"}])
     assert r.status_code == 200
+    assert r.headers["x-upstream-request-id"] == "req_HEADER"
     body = r.json()
     # §10.3.11/12: форма проксируется, id не подменяется заголовком
     assert body["id"] == "chatcmpl-up-1"
@@ -385,6 +386,7 @@ def test_stream_tool_call_delta_is_preserved(fake, caplog):
         ],
     )
     assert r.status_code == 200
+    assert r.headers["x-upstream-request-id"] == "req_HEADER"
     events = [line[6:] for line in r.text.splitlines() if line.startswith("data: ")]
     chunks = [json.loads(event) for event in events if event != "[DONE]"]
     tool_chunks = [
