@@ -101,8 +101,11 @@ def summarize_delta(chunk: dict[str, Any], result: dict[str, Any]) -> None:
                 value = delta.get(key)
                 if isinstance(value, str) and value and result["first_reasoning_ms"] is None:
                     result["first_reasoning_ms"] = elapsed_ms(result["_started"])
-            if delta.get("tool_calls") and result["first_tool_call_ms"] is None:
-                result["first_tool_call_ms"] = elapsed_ms(result["_started"])
+            tool_calls = delta.get("tool_calls")
+            if isinstance(tool_calls, list) and tool_calls:
+                result["saw_tool_calls"] = True
+                if result["first_tool_call_ms"] is None:
+                    result["first_tool_call_ms"] = elapsed_ms(result["_started"])
 
     usage = chunk.get("usage")
     if isinstance(usage, dict):
@@ -113,6 +116,27 @@ def summarize_delta(chunk: dict[str, Any], result: dict[str, Any]) -> None:
         }
     if isinstance(chunk.get("id"), str) and result["response_id"] is None:
         result["response_id"] = chunk["id"]
+
+
+def validate_tool_call_stream(result: dict[str, Any]) -> None:
+    """Reject incomplete or non-tool-call streams instead of reporting false success."""
+    errors: list[str] = result["protocol_errors"]
+    if result["malformed_frames"]:
+        errors.append("malformed_json_frame")
+    if not result["done_seen"]:
+        errors.append("missing_done")
+    if not result["saw_tool_calls"]:
+        errors.append("missing_tool_call_delta")
+    if result["finish_reasons"].get("tool_calls", 0) < 1:
+        errors.append("missing_tool_calls_finish_reason")
+    usage = result["usage"]
+    required_usage = ("prompt_tokens", "completion_tokens", "total_tokens")
+    if not result["usage_seen"] or any(
+        type(usage.get(key)) is not int or usage[key] < 0 for key in required_usage
+    ):
+        errors.append("missing_or_incomplete_usage")
+    if errors and result["error_type"] is None:
+        result["error_type"] = "invalid_sse_protocol"
 
 
 def elapsed_ms(started: float) -> int:
@@ -144,7 +168,11 @@ async def run_one(
         "usage": {},
         "response_id": None,
         "request_id": None,
+        "upstream_request_id": None,
         "done_seen": False,
+        "saw_tool_calls": False,
+        "malformed_frames": 0,
+        "protocol_errors": [],
         "error_type": None,
         "upstream_error_code": None,
         "upstream_error_type": None,
@@ -167,6 +195,10 @@ async def run_one(
                 result["status"] = response.status_code
                 result["response_open_ms"] = elapsed_ms(started)
                 result["request_id"] = response.headers.get("x-request-id")
+                if label == "direct":
+                    result["upstream_request_id"] = result["request_id"]
+                else:
+                    result["upstream_request_id"] = response.headers.get("x-upstream-request-id")
                 if response.status_code < 200 or response.status_code >= 300:
                     result["error_type"] = "http_error"
                     # Capture only structured error identifiers, never raw body/message.
@@ -203,12 +235,21 @@ async def run_one(
                         return
                     data = "\n".join(data_lines)
                     if data.strip() == "[DONE]":
+                        if result["done_seen"]:
+                            result["protocol_errors"].append("duplicate_done")
                         result["done_seen"] = True
                         data_lines.clear()
                         return
+                    if result["done_seen"]:
+                        result["protocol_errors"].append("event_after_done")
                     try:
                         chunk = json.loads(data)
                     except (ValueError, TypeError):
+                        result["malformed_frames"] += 1
+                        data_lines.clear()
+                        return
+                    if not isinstance(chunk, dict):
+                        result["malformed_frames"] += 1
                         data_lines.clear()
                         return
                     now_ms = elapsed_ms(started)
@@ -220,8 +261,7 @@ async def run_one(
                             result["max_event_gap_ms"], now_ms - previous_event_ms
                         )
                     previous_event_ms = now_ms
-                    if isinstance(chunk, dict):
-                        summarize_delta(chunk, result)
+                    summarize_delta(chunk, result)
                     data_lines.clear()
 
                 async for line in response.aiter_lines():
@@ -230,6 +270,7 @@ async def run_one(
                     elif line.startswith("data:"):
                         data_lines.append(line[5:].lstrip())
                 await process_frame()
+                validate_tool_call_stream(result)
                 if not result["done_seen"]:
                     result["error_type"] = "stream_incomplete_unknown_outcome"
     except httpx.TimeoutException:
@@ -248,17 +289,32 @@ def _clean_result(result: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-async def check_gateway_health(gateway_base: str, timeout_seconds: float) -> bool:
-    """Fail before any paid request if the configured local gateway is unreachable."""
+async def check_gateway_health(
+    gateway_base: str, timeout_seconds: float, gateway_key: str
+) -> tuple[bool, str]:
+    """Require an authenticated health response confirming real NanoGPT mode."""
     root = gateway_base.rstrip("/")
     if root.endswith("/v1"):
         root = root[:-3]
     try:
         async with httpx.AsyncClient(timeout=min(timeout_seconds, 5.0)) as client:
-            response = await client.get(root + "/health")
-        return response.status_code == 200
+            response = await client.get(
+                root + "/health",
+                headers={"Authorization": f"Bearer {gateway_key}"},
+            )
+        if response.status_code != 200:
+            return False, "health_http_error"
+        try:
+            body = response.json()
+        except ValueError:
+            return False, "health_invalid_json"
+        if not isinstance(body, dict) or body.get("status") != "ok":
+            return False, "health_invalid_response"
+        if body.get("upstream_mode") != "nanogpt":
+            return False, "gateway_not_confirmed_nanogpt"
+        return True, "ok"
     except httpx.HTTPError:
-        return False
+        return False, "health_unreachable"
 
 
 async def main() -> int:
@@ -291,8 +347,14 @@ async def main() -> int:
 
     direct_base = os.environ.get("NANOGPT_INFERENCE_BASE_URL", DEFAULT_NANOGPT_BASE)
     gateway_base = os.environ.get("GATEWAY_BASE_URL", DEFAULT_GATEWAY_BASE)
-    if not await check_gateway_health(gateway_base, args.timeout):
-        print("Gateway health check failed; no paid request was sent.", file=sys.stderr)
+    healthy, health_reason = await check_gateway_health(
+        gateway_base, args.timeout, gateway_key
+    )
+    if not healthy:
+        print(
+            f"Gateway preflight failed ({health_reason}); no paid request was sent.",
+            file=sys.stderr,
+        )
         return 2
 
     print("A/B comparison will send up to TWO paid streaming requests.")

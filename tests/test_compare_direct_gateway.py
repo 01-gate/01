@@ -1,3 +1,4 @@
+import asyncio
 import json
 import time
 from collections import Counter
@@ -5,7 +6,13 @@ from pathlib import Path
 
 import pytest
 
-from scripts.compare_direct_gateway import DEFAULT_NANOGPT_BASE, prepare_payload, summarize_delta
+from scripts.compare_direct_gateway import (
+    DEFAULT_NANOGPT_BASE,
+    check_gateway_health,
+    prepare_payload,
+    summarize_delta,
+    validate_tool_call_stream,
+)
 
 
 def test_prepare_payload_forces_stream_and_bounds_default_output(tmp_path):
@@ -63,6 +70,7 @@ def test_summarize_delta_records_only_safe_metadata():
         "usage_seen": False,
         "usage": {},
         "response_id": None,
+        "saw_tool_calls": False,
     }
 
     summarize_delta(
@@ -92,3 +100,95 @@ def test_summarize_delta_records_only_safe_metadata():
 
 def test_default_nanogpt_base_matches_documented_api_origin():
     assert DEFAULT_NANOGPT_BASE == "https://nano-gpt.com/api/v1"
+
+
+
+def _stream_result():
+    return {
+        "protocol_errors": [],
+        "malformed_frames": 0,
+        "done_seen": True,
+        "saw_tool_calls": True,
+        "finish_reasons": {"tool_calls": 1},
+        "usage_seen": True,
+        "usage": {"prompt_tokens": 10, "completion_tokens": 4, "total_tokens": 14},
+        "error_type": None,
+    }
+
+
+def test_validate_tool_call_stream_accepts_complete_tool_call():
+    result = _stream_result()
+
+    validate_tool_call_stream(result)
+
+    assert result["error_type"] is None
+    assert result["protocol_errors"] == []
+
+
+@pytest.mark.parametrize(
+    ("change", "expected_error"),
+    [
+        ({"done_seen": False}, "missing_done"),
+        ({"saw_tool_calls": False}, "missing_tool_call_delta"),
+        ({"finish_reasons": {"stop": 1}}, "missing_tool_calls_finish_reason"),
+        ({"usage_seen": False}, "missing_or_incomplete_usage"),
+        ({"malformed_frames": 1}, "malformed_json_frame"),
+    ],
+)
+def test_validate_tool_call_stream_rejects_incomplete_or_wrong_stream(change, expected_error):
+    result = {**_stream_result(), **change}
+
+    validate_tool_call_stream(result)
+
+    assert result["error_type"] == "invalid_sse_protocol"
+    assert expected_error in result["protocol_errors"]
+
+
+def test_validate_tool_call_stream_rejects_incomplete_usage_counts():
+    result = _stream_result()
+    result["usage"]["total_tokens"] = None
+
+    validate_tool_call_stream(result)
+
+    assert result["error_type"] == "invalid_sse_protocol"
+    assert "missing_or_incomplete_usage" in result["protocol_errors"]
+
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        ({"status": "ok", "upstream_mode": "nanogpt"}, (True, "ok")),
+        ({"status": "ok", "upstream_mode": "stub"}, (False, "gateway_not_confirmed_nanogpt")),
+        ({"status": "ok"}, (False, "gateway_not_confirmed_nanogpt")),
+    ],
+)
+def test_health_preflight_requires_confirmed_nanogpt_mode(monkeypatch, body, expected):
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return body
+
+    class FakeClient:
+        def __init__(self, timeout):
+            self.timeout = timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def get(self, url, headers):
+            assert url == "http://gateway/health"
+            assert headers == {"Authorization": "Bearer gateway-test-key"}
+            return FakeResponse()
+
+    monkeypatch.setattr("scripts.compare_direct_gateway.httpx.AsyncClient", FakeClient)
+
+    actual = asyncio.run(
+        check_gateway_health("http://gateway/v1", 90, "gateway-test-key")
+    )
+
+    assert actual == expected

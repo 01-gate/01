@@ -36,7 +36,22 @@ def _chat(**payload):
 
 
 def test_health():
-    assert request("GET", "/health").status_code == 200
+    response = request("GET", "/health")
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+
+
+def test_authenticated_health_reports_upstream_mode(monkeypatch):
+    monkeypatch.setenv("GATEWAY_UPSTREAM", "stub")
+    response = request("GET", "/health", headers=AUTH)
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok", "upstream_mode": "stub"}
+
+
+def test_unauthenticated_health_does_not_disclose_upstream_mode():
+    response = request("GET", "/health")
+    assert response.status_code == 200
+    assert "upstream_mode" not in response.json()
 
 
 def test_models_without_auth():
