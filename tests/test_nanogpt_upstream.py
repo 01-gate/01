@@ -822,6 +822,12 @@ def test_stream_normal_final_log_separates_states(fake, caplog):
     assert "upstream_status=200" in line
     assert "events=2" in line
     assert line.rstrip().endswith("error=-")
+    # Диагностика разделяет время открытия upstream и задержку первого события/текста.
+    assert "response_open_ms=" in line
+    assert "first_event_ms=" in line
+    assert "first_text_ms=" in line
+    assert "max_event_gap_ms=" in line
+    assert "error_detail=-" in line
 
 
 def test_unexpected_exception_after_start_logged_as_error(monkeypatch, caplog):
