@@ -1,3 +1,4 @@
+import asyncio
 import json
 import time
 from collections import Counter
@@ -7,6 +8,7 @@ import pytest
 
 from scripts.compare_direct_gateway import (
     DEFAULT_NANOGPT_BASE,
+    check_gateway_health,
     prepare_payload,
     summarize_delta,
     validate_tool_call_stream,
@@ -150,3 +152,43 @@ def test_validate_tool_call_stream_rejects_incomplete_usage_counts():
 
     assert result["error_type"] == "invalid_sse_protocol"
     assert "missing_or_incomplete_usage" in result["protocol_errors"]
+
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        ({"status": "ok", "upstream_mode": "nanogpt"}, (True, "ok")),
+        ({"status": "ok", "upstream_mode": "stub"}, (False, "gateway_not_confirmed_nanogpt")),
+        ({"status": "ok"}, (False, "gateway_not_confirmed_nanogpt")),
+    ],
+)
+def test_health_preflight_requires_confirmed_nanogpt_mode(monkeypatch, body, expected):
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return body
+
+    class FakeClient:
+        def __init__(self, timeout):
+            self.timeout = timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def get(self, url, headers):
+            assert url == "http://gateway/health"
+            assert headers == {"Authorization": "Bearer gateway-test-key"}
+            return FakeResponse()
+
+    monkeypatch.setattr("scripts.compare_direct_gateway.httpx.AsyncClient", FakeClient)
+
+    actual = asyncio.run(
+        check_gateway_health("http://gateway/v1", 90, "gateway-test-key")
+    )
+
+    assert actual == expected
