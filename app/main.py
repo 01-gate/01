@@ -186,7 +186,9 @@ async def chat_completions(request: Request):
     nano_log = (
         base_log
         + " status=%s response_id=%s upstream_request_id=%s billing_lookup_id=%s"
-        " upstream_status=%s usage=%s events=%s duration_ms=%s error=%s"
+        " upstream_status=%s usage=%s events=%s duration_ms=%s"
+        " response_open_ms=%s first_event_ms=%s first_text_ms=%s max_event_gap_ms=%s"
+        " error_detail=%s error=%s"
     )
 
     if _upstream_mode() == "nanogpt":
@@ -202,6 +204,11 @@ async def chat_completions(request: Request):
                 "seen" if meta.usage_seen else meta.extra.get("usage", "-"),
                 meta.events,
                 meta.duration_ms,
+                meta.response_open_ms if meta.upstream_status is not None else "-",
+                meta.first_event_ms if meta.first_event_ms is not None else "-",
+                meta.first_text_ms if meta.first_text_ms is not None else "-",
+                meta.max_event_gap_ms,
+                meta.error_detail or "-",
                 error,
             )
 
