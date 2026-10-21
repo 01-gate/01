@@ -190,7 +190,7 @@ async def chat_completions(request: Request):
         " response_open_ms=%s first_event_ms=%s first_text_ms=%s"
         " first_tool_call_ms=%s tool_call_events=%s tool_call_fragments=%s"
         " first_reasoning_ms=%s reasoning_events=%s max_event_gap_ms=%s"
-        " sse_event_types=%s delta_keys=%s upstream_fields=%s"
+        " sse_event_types=%s delta_keys=%s finish_reasons=%s upstream_fields=%s"
         " error_detail=%s error=%s"
     )
 
@@ -218,6 +218,7 @@ async def chat_completions(request: Request):
                 meta.max_event_gap_ms,
                 ",".join(f"{k}:{v}" for k, v in sorted(meta.sse_event_types.items())) or "-",
                 ",".join(f"{k}:{v}" for k, v in sorted(meta.delta_key_counts.items())) or "-",
+                ",".join(f"{k}:{v}" for k, v in sorted(meta.finish_reason_counts.items())) or "-",
                 meta.extra.get("upstream_fields", "-"),
                 meta.error_detail or "-",
                 error,
