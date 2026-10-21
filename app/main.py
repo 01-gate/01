@@ -204,7 +204,7 @@ async def chat_completions(request: Request):
                 "seen" if meta.usage_seen else meta.extra.get("usage", "-"),
                 meta.events,
                 meta.duration_ms,
-                meta.response_open_ms if meta.upstream_status is not None else "-",
+                meta.response_open_ms if meta.response_open_ms is not None else "-",
                 meta.first_event_ms if meta.first_event_ms is not None else "-",
                 meta.first_text_ms if meta.first_text_ms is not None else "-",
                 meta.max_event_gap_ms,
