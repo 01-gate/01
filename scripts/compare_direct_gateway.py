@@ -203,6 +203,8 @@ async def run_one(
                     elif line.startswith("data:"):
                         data_lines.append(line[5:].lstrip())
                 await process_frame()
+                if not result["done_seen"]:
+                    result["error_type"] = "stream_incomplete_unknown_outcome"
     except httpx.TimeoutException:
         result["error_type"] = "timeout_unknown_outcome"
     except httpx.HTTPError as exc:
@@ -262,8 +264,8 @@ async def main() -> int:
 
     gateway = await run_one("gateway", gateway_base, gateway_key, payload, args.timeout)
     print(json.dumps(gateway, ensure_ascii=False, sort_keys=True))
-    if gateway.get("error_type") == "timeout_unknown_outcome":
-        print("Gateway outcome is unknown. Do not retry blindly; inspect gateway logs/request IDs.", file=sys.stderr)
+    if gateway.get("error_type") in {"timeout_unknown_outcome", "stream_incomplete_unknown_outcome"}:
+        print("Gateway outcome is unknown or incomplete. Do not retry blindly; inspect gateway logs/request IDs.", file=sys.stderr)
         return 3
     return 0 if gateway.get("status") is not None and 200 <= gateway["status"] < 300 and not gateway.get("error_type") else 2
 
