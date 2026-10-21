@@ -1,124 +1,190 @@
+"""Локальный OpenAI-compatible gateway: auth, каталог, Chat Completions (stub)."""
+
+import hmac
 import json
 import logging
-import time
+import os
 from typing import Any
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
+
+from app.upstream.stub import run_chat
 
 MAX_BODY_BYTES = 1_048_576
 
-SECRET_HEADERS = {"authorization", "cookie", "set-cookie", "proxy-authorization", "x-api-key"}
-SECRET_KEYS = {"api_key", "apikey", "authorization", "token", "access_token", "secret", "password", "cookie"}
+PUBLIC_MODELS = {
+    "01": {"id": "01", "object": "model", "created": 1729500000, "owned_by": "local"},
+}
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("inspector")
-
-app = FastAPI(title="OpenCode request inspector")
-
-
-def _redact(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {k: "<redacted>" if str(k).lower() in SECRET_KEYS else _redact(v) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_redact(v) for v in value]
-    return value
+def _load_dotenv(path: str = ".env") -> None:
+    # shortcut: минимальный парсер вместо python-dotenv; только GATEWAY_* и не перезаписывает env
+    if not os.path.isfile(path):
+        return
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            key, sep, value = line.strip().partition("=")
+            if sep and key.startswith("GATEWAY_"):
+                os.environ.setdefault(key, value.strip().strip("\"'"))
 
 
-def _safe_headers(request: Request) -> dict[str, str]:
-    return {k: "<redacted>" if k.lower() in SECRET_HEADERS else v for k, v in request.headers.items()}
+_load_dotenv()
+
+logger = logging.getLogger("gateway")
+if not logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("%(message)s"))
+    logger.addHandler(_handler)
+logger.setLevel(os.environ.get("LOG_LEVEL", "INFO").upper())
+app = FastAPI()
+
+
+def _test_key() -> str:
+    return os.environ.get("GATEWAY_TEST_API_KEY", "")
+
+
+if not _test_key():
+    logger.warning("GATEWAY_TEST_API_KEY is not set; protected requests will be rejected with 401")
+
+
+def _error(message: str, code: str, status: int) -> JSONResponse:
+    return JSONResponse(
+        {"error": {"message": message, "type": "invalid_request_error", "code": code}},
+        status_code=status,
+    )
+
+
+def _auth(request: Request) -> tuple[bool, bool]:
+    header = request.headers.get("authorization", "")
+    auth_present = bool(header)
+    token = header[7:].strip() if header.startswith("Bearer ") else ""
+    key = _test_key()
+    auth_ok = bool(key) and bool(token) and hmac.compare_digest(token, key)
+    return auth_present, auth_ok
+
+
+def _auth_error() -> JSONResponse:
+    return _error("Invalid API key", "invalid_api_key", 401)
 
 
 @app.get("/health")
-async def health() -> dict[str, str]:
-    return {"status": "ok"}
+async def health():
+    return JSONResponse({"status": "ok"})
 
 
 @app.get("/v1/models")
-async def list_models() -> dict:
-    # shortcut: каталог захардкожен (одна модель), заменить на реестр при маппинге public->upstream ID
-    now = int(time.time())
-    return {
-        "object": "list",
-        "data": [
-            {
-                "id": "01",
-                "object": "model",
-                "created": now,
-                "owned_by": "local",
-                "name": "Local Stub 01",
-                "description": (
-                    "Local gateway stub model for OpenCode. "
-                    "No upstream call; returns deterministic fake completions."
-                ),
-                "context_length": 128000,
-                "max_output_tokens": 8192,
-                "architecture": {
-                    "modality": "text->text",
-                    "input_modalities": ["text"],
-                    "output_modalities": ["text"],
-                },
-                "capabilities": {
-                    "vision": False,
-                    "video_input": False,
-                    "audio_input": False,
-                    "reasoning": False,
-                    "tool_calling": True,
-                    "parallel_tool_calls": False,
-                    "structured_output": False,
-                    "pdf_upload": False,
-                    "batch_api": False,
-                },
-                "reasoning_efforts": [],
-                "supported_service_tiers": [],
-                "supported_batch_endpoints": [],
-                "pricing": {
-                    "prompt": 1.00,
-                    "completion": 2.50,
-                    "cacheReadInputPer1kTokens": 0.00025,
-                    "cacheWriteInputPer1kTokens": 0.00050,
-                    "currency": "RUB",
-                    "unit": "per_million_tokens"
-                },
-                "cost_estimate": 0.020,
-                "category": "Local",
-                "providers": ["local"],
-            }
-        ],
-    }
+async def list_models():
+    return JSONResponse({"object": "list", "data": list(PUBLIC_MODELS.values())})
 
 
-@app.post("/v1")
-@app.post("/v1/{path:path}")
-async def inspect(request: Request) -> JSONResponse:
-    path = request.url.path
+@app.post("/v1/chat/completions")
+async def chat_completions(request: Request):
+    auth_present, auth_ok = _auth(request)
+    if not auth_ok:
+        logger.info(
+            "chat method=POST path=/v1/chat/completions status=401 auth_present=%s auth_ok=False key_set=%s",
+            auth_present,
+            bool(_test_key()),
+        )
+        return _auth_error()
 
     body = bytearray()
-    async for chunk in request.stream():
-        body += chunk
+    async for part in request.stream():
+        body.extend(part)
         if len(body) > MAX_BODY_BYTES:
-            log.warning("=== %s %s === body_too_large size>%d", request.method, path, MAX_BODY_BYTES)
-            return JSONResponse({"received": False, "path": path, "error": "body_too_large"}, status_code=413)
-
-    log.info("=== %s %s ===", request.method, path)
-    log.info("content-type=%r body_size=%d", request.headers.get("content-type"), len(body))
-    auth = request.headers.get("authorization", "")
-    log.info("auth_present=%s auth_prefix=%s", bool(auth), auth[:20] if auth else "")
-    log.info("headers=%s", json.dumps(_safe_headers(request), ensure_ascii=False))
+            logger.info(
+                "chat method=POST path=/v1/chat/completions status=413 auth_present=%s auth_ok=True",
+                auth_present,
+            )
+            return _error("Request body too large", "body_too_large", 413)
 
     try:
-        payload = json.loads(bytes(body))
-    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-        # str(JSONDecodeError) есть только позиция, не содержимое тела
-        log.error("json_invalid error=%s: %s", type(exc).__name__, exc)
-        return JSONResponse({"received": True, "path": path, "json_valid": False}, status_code=400)
+        payload = json.loads(body)
+    except ValueError:
+        logger.info(
+            "chat method=POST path=/v1/chat/completions status=400 auth_present=%s auth_ok=True",
+            auth_present,
+        )
+        return _error("Invalid JSON body", "invalid_json", 400)
+    if not isinstance(payload, dict):
+        logger.info(
+            "chat method=POST path=/v1/chat/completions status=400 auth_present=%s auth_ok=True",
+            auth_present,
+        )
+        return _error("Invalid JSON body", "invalid_json", 400)
 
-    model = payload.get("model") if isinstance(payload, dict) else None
-    if model is not None:
-        log.info("model=%s", model)
-    if isinstance(payload, dict) and "messages" in payload:
-        log.info("isinstance")
-        #log.info("messages=%s", json.dumps(_redact(payload["messages"]), ensure_ascii=False, indent=2))
-    #log.info("payload=%s", json.dumps(_redact(payload), ensure_ascii=False, indent=2))
+    model = payload.get("model")
+    messages = payload.get("messages")
+    print(messages)
+    stream = payload.get("stream", False)
+    stream_options = payload.get("stream_options", {})
 
-    return JSONResponse({"received": True, "path": path, "json_valid": True})
+    def bad_request(code: str, message: str) -> JSONResponse:
+        logger.info(
+            "chat method=POST path=/v1/chat/completions status=400 auth_present=%s auth_ok=True model=%s stream=%s",
+            auth_present,
+            model if isinstance(model, str) else "-",
+            stream if isinstance(stream, bool) else "-",
+        )
+        return _error(message, code, 400)
+
+    if not isinstance(model, str) or not model:
+        return bad_request("invalid_model", "Invalid `model` field")
+    if not isinstance(messages, list) or not messages:
+        return bad_request("invalid_messages", "Invalid `messages` field")
+    if not all(isinstance(m, dict) and isinstance(m.get("role"), str) for m in messages):
+        return bad_request("invalid_messages", "Invalid `messages` field")
+    if not isinstance(stream, bool):
+        return bad_request("invalid_request_error", "Invalid `stream` field")
+    if not isinstance(stream_options, dict):
+        return bad_request("invalid_request_error", "Invalid `stream_options` field")
+
+    if model not in PUBLIC_MODELS:
+        logger.info(
+            "chat method=POST path=/v1/chat/completions status=404 auth_present=%s auth_ok=True model=%s stream=%s",
+            auth_present,
+            model,
+            stream,
+        )
+        return _error(f"The model `{model}` does not exist", "model_not_found", 404)
+
+    include_usage = bool(stream_options.get("include_usage", False))
+    extra_fields = sorted(set(payload) - {"model", "messages", "stream", "stream_options"})
+    extra = {k: payload[k] for k in extra_fields}
+    result = await run_chat(model, messages, stream, include_usage, extra)
+
+    if not stream:
+        logger.info(
+            "chat method=POST path=/v1/chat/completions status=200 auth_present=%s auth_ok=True model=%s stream=False messages_count=%s request_id=%s extra_fields=%s",
+            auth_present,
+            model,
+            len(messages),
+            result["id"],
+            ",".join(extra_fields) or "-",
+        )
+        return JSONResponse(result)
+
+    async def sse() -> Any:
+        request_id = "-"
+        try:
+            async for chunk in result:
+                print(chunk)
+                request_id = chunk.get("id", request_id)
+                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+            yield "data: [DONE]\n\n"
+        finally:
+            # лог здесь: request_id известен и при disconnect клиента
+            logger.info(
+                "chat method=POST path=/v1/chat/completions status=200 auth_present=%s auth_ok=True model=%s stream=True messages_count=%s request_id=%s extra_fields=%s",
+                auth_present,
+                model,
+                len(messages),
+                request_id,
+                ",".join(extra_fields) or "-",
+            )
+
+    return StreamingResponse(
+        sse(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+    )

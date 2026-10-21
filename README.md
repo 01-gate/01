@@ -1,6 +1,6 @@
-# OpenCode request inspector
+# zer0ne local gateway (mock)
 
-Локальный FastAPI-приёмник для наблюдения за реальными HTTP-запросами OpenCode (`@ai-sdk/openai-compatible`). Генерации нет, upstream нет, секреты в лог не попадают.
+Локальный OpenAI-compatible API для OpenCode: auth по тестовому ключу, каталог моделей, Chat Completions (sync и SSE stream) со **stub-генерацией**. Внешних HTTP-вызовов нет — NanoGPT не подключён (см. `.spec/SPEC_002.md`).
 
 ## Запуск
 
@@ -8,26 +8,25 @@
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+export GATEWAY_TEST_API_KEY="test-key"
 uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
-## Подключение OpenCode
+`HOST`/`PORT`/`LOG_LEVEL` — опционально (по умолчанию `127.0.0.1` / `8000` / `INFO`). Без `GATEWAY_TEST_API_KEY` сервер стартует с warning и отвечает 401 на защищённые маршруты.
 
-`opencode.json` в корне объявляет провайдер `local` с моделью `01`. Выбери `local/01` в OpenCode и отправь запрос. Топ-level `"model"` не задан намеренно: конфиг не перехватывает модель по умолчанию.
+## Контракт
 
-## Фактический контракт
+- `GET /health` — liveness, без auth.
+- `GET /v1/models` — каталог (модель `01`), Bearer обязателен.
+- `POST /v1/chat/completions` — Bearer обязателен, sync (`stream: false`) или SSE (`stream: true`).
+  - stream: чанки по словам, финальный `finish_reason: "stop"`, при `stream_options.include_usage: true` — отдельный usage-чанок, затем `data: [DONE]`.
+- Неверный/отсутствующий ключ → `401` **до** генерации. Невалидный JSON / нет `messages` → `400`. Неизвестная модель → `404 model_not_found`. Тело > 1 MiB → `413`. Пути `/api/v1` не обслуживаются.
+- Форма ответов — OpenAI Chat Completions; текст заглушки: `[local-stub] model=01 ok. Last user: ...`; usage — детерминированная фейковая оценка (`len/4`), не биллинг.
+- В логи не попадают ключ и полные `messages` (только метаданные).
 
-- `POST /api`, `POST /api/`, `POST /api/{path}` — приём JSON, pretty-print в stdout.
-- Ответ — диагностический JSON, **не** OpenAI Chat Completions: `{"received", "path", "json_valid"}`.
-- Некорректный JSON — `400`, тело больше 1 MiB — `413`. Ошибки не роняют сервер.
-- `GET /health` — `{"status":"ok"}`.
-- `GET /v1/models` — каталог из одной модели `01` (захардкожен).
-- `GET /api` — `405`. Другие методы не реализованы намеренно.
-- Не логируются: `Authorization`, `Cookie`, `Set-Cookie`, `X-Api-Key`; в JSON значения ключей `api_key`, `token`, `secret`, `password` и т.п.
+## OpenCode
 
-## Ограничения совместимости
-
-Диагностический ответ не содержит `choices`/`message`/`finish_reason`, поэтому запрос OpenCode завершится ошибкой клиента. Это ожидаемо: этап фиксирует входящий контракт. Следующий этап — минимальный ответ Chat Completions.
+`opencode.jsonc`, провайдер `local`: `baseURL: http://127.0.0.1:8000/v1`, `apiKey: {env:GATEWAY_TEST_API_KEY}`, модель `01`. Значение `GATEWAY_TEST_API_KEY` в окружении OpenCode должно совпадать с серверным.
 
 ## Тесты
 
