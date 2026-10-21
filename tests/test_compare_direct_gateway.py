@@ -4,7 +4,7 @@ from collections import Counter
 
 import pytest
 
-from scripts.compare_direct_gateway import prepare_payload, summarize_delta
+from scripts.compare_direct_gateway import DEFAULT_NANOGPT_BASE, prepare_payload, summarize_delta
 
 
 def test_prepare_payload_forces_stream_and_bounds_default_output(tmp_path):
@@ -77,3 +77,8 @@ def test_summarize_delta_records_only_safe_metadata():
     assert result["usage"]["total_tokens"] == 17
     assert secret not in repr(result)
     assert "private reasoning" not in repr(result)
+
+
+
+def test_default_nanogpt_base_matches_documented_api_origin():
+    assert DEFAULT_NANOGPT_BASE == "https://nano-gpt.com/api/v1"
