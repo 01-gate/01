@@ -1,6 +1,6 @@
 # NOTES_NANOGPT_CONTRACT.md
 
-**Статус:** план контрактного smoke-теста, результаты пока не сняты  
+**Статус:** smoke-тест выполнен, результаты сняты (см. §4, §6–§8, §9, §11)  
 **Дата:** 2026-10-21  
 **Цель:** установить фактический минимальный контракт NanoGPT перед подключением upstream к gateway.
 
@@ -130,21 +130,28 @@ done
 
 Этот вывод служит только для первичного осмотра первых трёх записей. Для итогового маппинга нужно установить реальную схему всего каталога и выбрать только модель, которая доступна и разрешена для нашего сервиса. Не считать `context`, pricing или capabilities обязательными, пока их наличие и смысл не подтверждены.
 
-### Записать по каждому host
+Результаты по каждому host (оба проверены, читательские запросы каталога 2026-10-21):
 
-| Проверка | Результат |
-|---|---|
-| HTTP status `/models` | `NOT RUN` |
-| HTTP status `/models?detailed=true` | `NOT RUN` |
-| Финальный URL после redirect | `NOT RUN` |
-| Форма корневого JSON и путь к списку моделей | `NOT RUN` |
-| Поля точного model ID | `NOT RUN` |
-| Поле контекста и его единицы/семантика | `UNKNOWN` |
-| Поля цены, валюта, единицы расчёта | `UNKNOWN` |
-| Поля capabilities и их семантика | `UNKNOWN` |
-| Отличия между host | `UNKNOWN` |
+| Проверка | `nano-gpt.com/api/v1` | `api.nano-gpt.com/api/v1` |
+|---|---|---|
+| HTTP status `/models` | `200`, `application/json` | `200`, `application/json` |
+| HTTP status `/models?detailed=true` | `200`, `application/json` | `200`, `application/json` |
+| Финальный URL после redirect | без redirect, URL не изменился | без redirect, URL не изменился |
+| Форма корневого JSON и путь к списку моделей | `{"data": [...], "object": ...}`, список в `.data`, 668 записей | та же форма, 661 запись |
+| Поля точного model ID | `id` (в элементах `.data`: `created`, `id`, `object`, `owned_by`) | идентично |
+| Поле контекста и его единицы/семантика | `context_length` в `detailed=true` (например 1048576); единицы/семантика не подтверждены документом → `UNKNOWN` | идентично |
+| Поля цены, валюта, единицы расчёта | `pricing.{prompt, completion, cacheReadInputPer1kTokens, cacheWriteInputPer1kTokens, currency:"USD", unit:"per_million_tokens"}`, плюс `cost_estimate`; семантика `cost_estimate` → `UNKNOWN` | идентично |
+| Поля capabilities и их семантика | `capabilities.{vision, video_input, audio_input, reasoning, tool_calling, parallel_tool_calls, structured_output, pdf_upload, batch_api}` — наличие подтверждено, точная семантика значений `UNKNOWN` | идентично |
+| Отличия между host | 8 model ID есть только здесь, 1 (`perplexity/pplx-decider-v1.1-27b`) только на `api.nano-gpt.com`; запись `xiaomi/mimo-v2.6-flash` побайтово идентична на обоих → `OBSERVED ONCE` | см. слева |
+
+Статусы: HTTP/форма — `CONFIRMED BY SMOKE TEST`; контекст-семантика, `cost_estimate`, semantics capabilities — `UNKNOWN`.
 
 Не публиковать полный список автоматически. Для выбранной модели зафиксировать точный upstream ID и подтверждающие поля.
+
+### Выбранная модель
+
+- Точный upstream ID: `xiaomi/mimo-v2.6-flash` (наличие подтверждено в живом каталоге обоих host, статус `CONFIRMED BY SMOKE TEST`).
+- Цена из `detailed=true` (для контроля стоимости платного вызова): input `0.14` USD/1M, output `0.28` USD/1M, `context_length: 1048576`, `max_output_tokens: 131072` — статус `OBSERVED ONCE` (каталог, не тарифный документ).
 
 ## 5. Выбор модели и контроль стоимости
 
@@ -218,6 +225,16 @@ jq '{
 - Есть ли finish reason.
 - Если ответ неуспешен, не делать автоматический повтор.
 
+Результат (2026-10-21, модель `xiaomi/mimo-v2.6-flash`):
+
+- HTTP `200`, `application/json`, `time≈10.0s`.
+- JSON `id`: `chatcmpl-2e0defc2-730e-4ab9-9f84-3e6130793e43`; HTTP-заголовок `x-request-id: req_a6cb487d-748c-4b40-95d5-fbef639c6013` — разные источники, не равны (`OBSERVED ONCE`).
+- `model` в ответе: `xiaomi/mimo-v2.6-flash`.
+- `finish_reason`: `length` (из-за `max_tokens: 8`).
+- `usage`: присутствуют `prompt_tokens=12`, `completion_tokens=8`, `total_tokens=20`, `cache_read_input_tokens=0`, `prompt_tokens_details`, `completion_tokens_details`, `reasoning_tokens=0`, `input_tokens=12`, `cost=3.92e-06`, `currency="USD"`; типы числовые (`OBSERVED ONCE`).
+- Pricing-метаданные: верхнеуровневый `x_nanogpt_pricing` с ключами `amount`, `currency`, `paymentSource`; `usage.cost` совпадает с позже полученным billing lookup — противоречий нет (`OBSERVED ONCE`, контрактом не считается).
+- Верхнеуровневые ключи ответа: `choices`, `created`, `id`, `model`, `object`, `service_tier`, `system_fingerprint`, `usage`, `x_nanogpt_pricing`.
+
 ## 7. Один streaming Chat Completions запрос
 
 Выполнять только после успешной проверки цены и выбранной модели. Это второй и последний плановый платный вызов в данном smoke-тесте.
@@ -277,6 +294,15 @@ grep '^data: *{' "${SMOKE_DIR}/stream.sse" \
 - Что происходит с usage, если поток завершился без ожидаемого финального chunk.
 - Не интерпретировать успешное закрытие соединения само по себе как подтверждение биллинга.
 
+Результат (2026-10-21, тот же model ID, второй и последний плановый платный вызов):
+
+- HTTP `200`, `content-type: text/event-stream`, `x-request-id: req_49e49ccd-fc3e-4257-b413-00e9c7f1db04`, `time≈4.9s`.
+- `stream_options.include_usage` принят без ошибки (`CONFIRMED BY SMOKE TEST` для этих вызовов; универсальность не утверждается).
+- Порядок чанков: 5 JSON-событий `data:` (1: `delta.role=assistant`; 2–3: `delta.reasoning`; 4: пустые дельты; 5: `finish_reason="length"` с `usage` и `x_nanogpt_pricing`), затем `data: [DONE]` (строка 11 файла), маркера `event:` нет.
+- Usage chunk: отдельного usage-only чанка и `choices: []` **не наблюдалось** — `usage` пришёл в том же финальном чанке, где `finish_reason` (`OBSERVED ONCE`).
+- В `x_nanogpt_pricing` финального чанка есть `requestId`, равный заголовочному `X-Request-ID`.
+- `data: [DONE]` присутствует и приходит последним, после usage-содержащего чанка.
+
 ### Disconnect
 
 Обычный завершённый stream не проверяет поведение при отключении клиента. Если этот сценарий необходимо проверить, выполнить его отдельно только после оценки стоимости и ручного решения. Не использовать автоматические повторы. Записать отдельно: клиентский disconnect, завершился ли upstream, получен ли request ID, можно ли затем найти billing record. Если это нельзя надёжно установить без дополнительного платного запроса, оставить `UNKNOWN`.
@@ -315,28 +341,37 @@ curl --silent --show-error \
 
 Если endpoint возвращает `401`/`403`, зафиксировать, что inference key не получил доступ в этой проверке. Не делать вывод, что endpoint существует только для management credentials, пока это отдельно не подтверждено документацией или разрешённой проверкой с management token. Management token не использовать для inference.
 
+### Результаты (2026-10-21)
+
+Важное наблюдение о путях: на host `api.nano-gpt.com` inference обслуживается под `/v1` (работает `${NANOGPT_BASE_URL}/chat/completions`), а Usage и Request Billing документированы и работают только под `/api/v1`. Запросы по `${NANOGPT_BASE_URL}/usage` и `${NANOGPT_BASE_URL}/usage/requests/{id}` вернули `404` с `text/html` (страница приложения) — это путь, а не отсутствие записи. Повторный read-only lookup по документированному пути выполнен (разрешено §8):
+
+- `GET https://api.nano-gpt.com/api/v1/usage` → `HTTP 200`, `application/json`: `object="usage"`, `scope="current_key"`, `from=2026-09-22`, `to=2026-10-21`, `groupBy=day,model`, `totals.{requests=22, costUsd=0.01054133, netCostUsd=0.01054133, inputTokens=408726, outputTokens=6542, totalTokens=415268}` — агрегат ключа за 30 дней, не конкретный вызов (`CONFIRMED BY SMOKE TEST`).
+- `GET https://api.nano-gpt.com/api/v1/usage/requests/req_49e49ccd-fc3e-4257-b413-00e9c7f1db04` (ID взят из HTTP-заголовка ответа) → `HTTP 200`: `object="request_billing"`, `created_at=2026-10-21T13:21:56.729000Z`, `expires_at=2026-10-22T13:21:56.729000Z`, `cost="0.00000392"` (decimal string), `currency="USD"`, `cost_scope="primary_charge"`, `usage.{input_tokens=12, output_tokens=8, reasoning_tokens=null}` (`CONFIRMED BY SMOKE TEST`).
+- Начальный `404` объяснён неверным путём; отдельно значение « billed-записи нет » не проверялось, `404` не интерпретировался как нулевой расход.
+- `GET /usage` с inference key доступен без management credentials (`CONFIRMED BY SMOKE TEST`).
+
 ## 9. Таблица результатов
 
-Заполнить по фактическим результатам. До выполнения все значения `NOT RUN` / `UNKNOWN`.
+Заполнено по фактическим результатам 2026-10-21.
 
 | Область | Факт / наблюдение | Статус |
 |---|---|---|
-| Host `nano-gpt.com` | `NOT RUN` | NOT RUN |
-| Host `api.nano-gpt.com` | `NOT RUN` | NOT RUN |
-| Каталог и форма JSON | `NOT RUN` | NOT RUN |
-| `detailed=true`: ID / context / pricing / capabilities | `NOT RUN` | NOT RUN |
-| Точный upstream model ID | `NOT RUN` | NOT RUN |
-| Sync: HTTP status и content type | `NOT RUN` | NOT RUN |
-| Sync: JSON `id` / response headers / `X-Request-ID` | `NOT RUN` | NOT RUN |
-| Sync: usage shape и значения | `NOT RUN` | NOT RUN |
-| Sync: cost / currency / pricing metadata | `NOT RUN` | NOT RUN |
-| Stream: HTTP status и content type | `NOT RUN` | NOT RUN |
-| Stream: usage chunk с `include_usage` | `NOT RUN` | NOT RUN |
-| Stream: `[DONE]` / терминальное событие | `NOT RUN` | NOT RUN |
-| Stream disconnect / billing outcome | `UNKNOWN` | UNKNOWN |
-| `GET /usage` с inference key | `NOT RUN` | NOT RUN |
-| Request Billing с inference key | `NOT RUN` | NOT RUN |
-| Значение billing `404` | `UNKNOWN` | UNKNOWN |
+| Host `nano-gpt.com` | `/models` и `/models?detailed=true` → `200` JSON, без redirect, 668 моделей | CONFIRMED BY SMOKE TEST |
+| Host `api.nano-gpt.com` | то же, `200`, 661 модель | CONFIRMED BY SMOKE TEST |
+| Каталог и форма JSON | корень `{"data":[...], "object":...}`, список в `.data`; plain-форма: `id`, `created`, `object`, `owned_by` | CONFIRMED BY SMOKE TEST |
+| `detailed=true`: ID / context / pricing / capabilities | ID=`id`; контекст=`context_length` (единицы не подтверждены); pricing=`pricing.{prompt,completion,currency=USD,unit=per_million_tokens,...}`; capabilities=`capabilities.*` — семантика значений `UNKNOWN` | CONFIRMED BY SMOKE TEST (поля), семантика частично UNKNOWN |
+| Точный upstream model ID | `xiaomi/mimo-v2.6-flash`, есть в каталоге обоих host, запись идентична; цена из каталога 0.14/0.28 USD за 1M | CONFIRMED BY SMOKE TEST |
+| Sync: HTTP status и content type | `200`, `application/json`, `time≈10.0s` | CONFIRMED BY SMOKE TEST |
+| Sync: JSON `id` / response headers / `X-Request-ID` | JSON `chatcmpl-2e0defc2-…`; заголовок `req_a6cb487d-748c-4b40-95d5-fbef639c6013`; не равны | OBSERVED ONCE |
+| Sync: usage shape и значения | `prompt=12, completion=8, total=20, input_tokens=12, cache_read=0, reasoning=0, details-*`, `cost=3.92e-06`, `currency=USD`; `finish_reason=length` | OBSERVED ONCE |
+| Sync: cost / currency / pricing metadata | `usage.cost=3.92e-06 USD` + `x_nanogpt_pricing{amount,currency,paymentSource}`; совпадает с billing lookup, противоречий нет | OBSERVED ONCE (контрактом не считается) |
+| Stream: HTTP status и content type | `200`, `text/event-stream`, `x-request-id: req_49e49ccd-fc3e-4257-b413-00e9c7f1db04` | CONFIRMED BY SMOKE TEST |
+| Stream: usage chunk с `include_usage` | параметр принят; usage пришёл в финальном чанке вместе с `finish_reason`; отдельного usage-only чанка и `choices: []` не было | OBSERVED ONCE |
+| Stream: `[DONE]` / терминальное событие | `data: [DONE]` последним, после usage-чанка; `event:`-строк нет | CONFIRMED BY SMOKE TEST |
+| Stream disconnect / billing outcome | не проверялось (требовалось ручное решение о стоимости) | UNKNOWN |
+| `GET /usage` с inference key | `${NANOGPT_BASE_URL}/usage` → `404` HTML (путь не тот); документированный `/api/v1/usage` → `200`, totals `requests=22, costUsd=0.01054133` (агрегат за 30 дней) | CONFIRMED BY SMOKE TEST (документированный путь) |
+| Request Billing с inference key | по `${NANOGPT_BASE_URL}` → `404` HTML; по `/api/v1/usage/requests/req_49e49ccd-…` → `200`, `cost="0.00000392"` USD, `primary_charge`, токены 12/8 | CONFIRMED BY SMOKE TEST |
+| Значение billing `404` | первый `404` вызван неверным префиксом пути, запись нашлась при read-only повторе; `404` так и не означал нулевой расход | OBSERVED ONCE |
 
 Разрешённые статусы: `CONFIRMED BY SMOKE TEST`, `OBSERVED ONCE`, `DOCUMENTED`, `UNKNOWN`, `NOT RUN`, `CONTRADICTION`. Один успешный запрос подтверждает только наблюдавшийся путь и модель, а не универсальный контракт всех моделей NanoGPT.
 
@@ -361,6 +396,25 @@ curl --silent --show-error \
 - Отправить минимальный completion с валидным ключом через текущую конфигурацию OpenCode: ожидается публичный `model: "01"` и `usage.total_tokens > 0` в stub-ответе.
 - Проверить `GET /v1/models`: опубликован только явно разрешённый alias.
 - Записать точные команды, exit status и фактический результат. Не считать проверки выполненными без запуска.
+
+### Результаты gate (2026-10-21)
+
+Gateway уже работал: `uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload` (pid 1601655), ключ `GATEWAY_TEST_API_KEY` подтянут самим приложением из `.env` (значение совпадает с `apiKey` провайдера `local` в `opencode.jsonc`).
+
+| Проверка | Команда / действие | Exit / статус | Результат |
+|---|---|---|---|
+| Основной agent | `opencode run -m local/01 "Reply with exactly OK."` (timeout 90s) | `exit=0`, завершился до таймаута | Ответ: `[local-stub] model=01 ok. Last user: "Reply with exactly OK."`, модель `01`; соединения с `127.0.0.1:8000` наблюдалось |
+| Title-generator | сессия той же команды `ses_ea15bebedffeSwlcz2Y5xr9z7O` | title установлен 2026-10-21 13:26:14 UTC (через ~1s после старта), зависаний нет | Обе части завершились (`CONFIRMED BY SMOKE TEST`); какую модель использовал title-generator, не устанавливалось → `UNKNOWN` |
+| Неверный client Bearer key | `POST /v1/chat/completions`, `Authorization: Bearer wrong-key` | `HTTP 401` | `{"error":{..., "code":"invalid_api_key"}}`; отклонён до `run_chat` (проверено по коду `app/main.py`) |
+| Без `Authorization` | тот же endpoint без заголовка | `HTTP 401` | то же тело ошибки |
+| Валидный completion | `POST /v1/chat/completions`, ключ из `.env`, `model: "01"` | `HTTP 200` | `model="01"`, `usage.total_tokens=17 > 0`, `finish_reason="stop"` (≥ подтверждено и через `opencode run`) |
+| `GET /v1/models` | с валидным ключом | `HTTP 200` | каталог ровно один alias `{"id":"01"}` |
+
+Наблюдения вне критериев gate (не исправлялось в рамках спеки):
+
+- `GET /v1/models` не проверяет `Authorization` вообще — `200` и без заголовка; README утверждает «Bearer обязателен» → `CONTRADICTION` README↔код.
+- `opencode.jsonc`: провайдер `local` использует литерал `apiKey: "huy-v-jope"` вместо `{env:GATEWAY_TEST_API_KEY}`, как описано в README; значения совпадают, но штатно ключ придётся синхронизировать вручную.
+- В `opencode.jsonc` провайдер `nano-gpt` хранит живой inference key открытым текстом — риск утечки при коммите, вне рамок этой спеки.
 
 ## 12. Решения, которые нельзя принимать по результатам одного smoke
 
