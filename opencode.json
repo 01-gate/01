@@ -1,0 +1,17 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "local": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Local Gateway",
+      "options": {
+        "baseURL": "http://127.0.0.1:8000/api"
+      },
+      "models": {
+        "01": {
+          "name": "01"
+        }
+      }
+    }
+  }
+}

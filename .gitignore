@@ -1,0 +1,15 @@
+.idea
+.pytest_cache
+.vscode
+env
+.venv
+lib
+__pycache__
+.opencode/index
+.env
+.env.*
+!.env.example
+config/.env.influxdb2-admin-*
+__pycache__/
+.coverage
+htmlcov/
