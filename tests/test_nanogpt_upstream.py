@@ -143,7 +143,7 @@ class FakeUpstream:
                                             }
                                         ]
                                     },
-                                    "finish_reason": None,
+                                    "finish_reason": "tool_calls",
                                 }
                             ],
                         }
@@ -294,24 +294,29 @@ def test_sync_proxied_with_separate_ids(fake, caplog):
     assert fake.requests[0]["path"] == "/v1/chat/completions"
 
 
-def test_forwarded_parameters_are_explicit_and_reasoning_effort_is_not_forwarded(fake):
-    # Input logs show fields sent by the client; this asserts the actual upstream payload.
+def test_forwarded_parameters_are_explicit_and_reasoning_effort_is_forwarded(fake):
+    # NanoGPT documents reasoning_effort and reasoning controls for Chat Completions.
     r = _chat(
         model="01",
         messages=[{"role": "user", "content": "hi"}],
         temperature=0.2,
         max_completion_tokens=123,
         reasoning_effort="high",
+        reasoning={"exclude": True},
         unsupported_client_option="not-forwarded",
     )
     assert r.status_code == 200
     sent = fake.requests[-1]["payload"]
     assert sent["temperature"] == 0.2
     assert sent["max_completion_tokens"] == 123
-    assert "reasoning_effort" not in sent
+    assert sent["reasoning_effort"] == "high"
+    assert sent["reasoning"] == {"exclude": True}
     assert "unsupported_client_option" not in sent
     assert "messages" in sent and "model" in sent
-    assert set(sent) == {"model", "messages", "temperature", "max_completion_tokens"}
+    assert set(sent) == {
+        "model", "messages", "temperature", "max_completion_tokens",
+        "reasoning_effort", "reasoning",
+    }
 
 
 def test_tool_calling_fields_forwarded_to_upstream(fake):
@@ -395,7 +400,69 @@ def test_stream_tool_call_delta_is_preserved(fake, caplog):
     assert "tool_call_events=1" in line
     assert "tool_call_fragments=1" in line
     assert "first_tool_call_ms=" in line
+    assert "finish_reasons=tool_calls:1" in line
     assert "TOP_SECRET" not in line
+
+
+def test_tool_call_roundtrip_is_client_driven_and_not_retried(fake):
+    # A tool call is returned to the client; the client submits its result in a new request.
+    # The gateway must preserve both turns and must not execute/retry tool calls itself.
+    fake.mode = "tool_stream"
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+            },
+        },
+    }]
+    first = _chat(
+        model="01",
+        messages=[{"role": "user", "content": "Read README.md"}],
+        stream=True,
+        tools=tools,
+        tool_choice="auto",
+    )
+    assert first.status_code == 200
+    chunks = [
+        json.loads(line[6:])
+        for line in first.text.splitlines()
+        if line.startswith("data: ") and line[6:] != "[DONE]"
+    ]
+    calls = [
+        call
+        for chunk in chunks
+        for choice in chunk.get("choices", [])
+        for call in choice.get("delta", {}).get("tool_calls", [])
+    ]
+    assert calls and calls[0]["function"]["name"] == "read_file"
+
+    fake.mode = "ok"
+    messages = [
+        {"role": "user", "content": "Read README.md"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "arguments": json.dumps({"path": "README.md"}),
+                },
+            }],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "README contents"},
+    ]
+    second = _chat(model="01", messages=messages, tools=tools)
+    assert second.status_code == 200
+    assert len(fake.requests) == 2
+    assert fake.requests[0]["payload"]["stream"] is True
+    assert fake.requests[1]["payload"]["messages"] == messages
+    assert fake.requests[1]["payload"]["tools"] == tools
 
 
 def test_usage_base_url_never_used(fake):
@@ -860,6 +927,7 @@ def test_stream_normal_final_log_separates_states(fake, caplog):
     assert "reasoning_events=0" in line
     assert "sse_event_types=message:2" in line
     assert "delta_keys=content:2,role:1" in line
+    assert "finish_reasons=stop:1" in line
     assert "upstream_fields=" in line
     assert "error_detail=-" in line
 
