@@ -26,6 +26,9 @@ logger = logging.getLogger("gateway.upstream")
 # отбрасывается: умолчания upstream, инструкции (§5.2 «только нужные поля»).
 FORWARD_FIELDS = (
     "stream_options",
+    "tools",
+    "tool_choice",
+    "parallel_tool_calls",
     "temperature",
     "top_p",
     "max_tokens",
