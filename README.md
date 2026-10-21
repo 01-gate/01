@@ -20,6 +20,8 @@ uvicorn app.main:app --host 127.0.0.1 --port 8000
 - `POST /api`, `POST /api/`, `POST /api/{path}` — приём JSON, pretty-print в stdout.
 - Ответ — диагностический JSON, **не** OpenAI Chat Completions: `{"received", "path", "json_valid"}`.
 - Некорректный JSON — `400`, тело больше 1 MiB — `413`. Ошибки не роняют сервер.
+- `GET /health` — `{"status":"ok"}`.
+- `GET /v1/models` — каталог из одной модели `01` (захардкожен).
 - `GET /api` — `405`. Другие методы не реализованы намеренно.
 - Не логируются: `Authorization`, `Cookie`, `Set-Cookie`, `X-Api-Key`; в JSON значения ключей `api_key`, `token`, `secret`, `password` и т.п.
 

@@ -93,3 +93,21 @@ def test_error_does_not_stop_server():
 def test_get_not_implemented():
     # Не имитируем поддержку GET: честный 405 по умолчанию
     assert client.get("/api").status_code == 405
+
+
+def test_health():
+    r = client.get("/health")
+    assert r.status_code == 200
+    assert r.json() == {"status": "ok"}
+
+
+def test_v1_models():
+    r = client.get("/v1/models")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["object"] == "list"
+    (model,) = body["data"]
+    assert model["id"] == "01"
+    assert model["object"] == "model"
+    assert model["owned_by"] == "local"
+    assert isinstance(model["created"], int) and model["created"] > 0

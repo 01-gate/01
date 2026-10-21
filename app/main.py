@@ -1,5 +1,6 @@
 import json
 import logging
+import time
 from typing import Any
 
 from fastapi import FastAPI, Request
@@ -28,8 +29,24 @@ def _safe_headers(request: Request) -> dict[str, str]:
     return {k: "<redacted>" if k.lower() in SECRET_HEADERS else v for k, v in request.headers.items()}
 
 
-@app.post("/api")
-@app.post("/api/{path:path}")
+@app.get("/health")
+async def health() -> dict[str, str]:
+    return {"status": "ok"}
+
+
+@app.get("/v1/models")
+async def list_models() -> dict:
+    # shortcut: каталог захардкожен (одна модель), заменить на реестр при маппинге public->upstream ID
+    return {
+        "object": "list",
+        "data": [
+            {"id": "01", "object": "model", "created": int(time.time()), "owned_by": "local"},
+        ],
+    }
+
+
+@app.post("/v1")
+@app.post("/v1/{path:path}")
 async def inspect(request: Request) -> JSONResponse:
     path = request.url.path
 
@@ -42,6 +59,8 @@ async def inspect(request: Request) -> JSONResponse:
 
     log.info("=== %s %s ===", request.method, path)
     log.info("content-type=%r body_size=%d", request.headers.get("content-type"), len(body))
+    auth = request.headers.get("authorization", "")
+    log.info("auth_present=%s auth_prefix=%s", bool(auth), auth[:20] if auth else "")
     log.info("headers=%s", json.dumps(_safe_headers(request), ensure_ascii=False))
 
     try:
@@ -55,7 +74,8 @@ async def inspect(request: Request) -> JSONResponse:
     if model is not None:
         log.info("model=%s", model)
     if isinstance(payload, dict) and "messages" in payload:
-        log.info("messages=%s", json.dumps(_redact(payload["messages"]), ensure_ascii=False, indent=2))
-    log.info("payload=%s", json.dumps(_redact(payload), ensure_ascii=False, indent=2))
+        log.info("isinstance")
+        #log.info("messages=%s", json.dumps(_redact(payload["messages"]), ensure_ascii=False, indent=2))
+    #log.info("payload=%s", json.dumps(_redact(payload), ensure_ascii=False, indent=2))
 
     return JSONResponse({"received": True, "path": path, "json_valid": True})
