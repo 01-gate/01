@@ -7,7 +7,7 @@
       "name": "NanoGPT",
       "options": {
         "baseURL": "https://nano-gpt.com/api/v1",
-        "apiKey": "{env:NANOGPT_API_KEY}"
+        "apiKey": "sk-nano-c450e8e4-2527-426a-843e-79cec1097875"
       },
       "models": {
         "xiaomi/mimo-v2.6-flash": {
@@ -16,7 +16,7 @@
             "context": 1000000,
             "output": 8192
           },
-          "cost": { "input": 0.14, "output": 0.28, "cache_read": 0.0028, "cache_write": 0 }
+          "cost": { "input": 12.5, "output": 25, "cache_read": 0.25, "cache_write": 0 }
         }
       }
     },
