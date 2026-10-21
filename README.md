@@ -8,7 +8,8 @@
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-export GATEWAY_TEST_API_KEY="test-key"
+set -a; . ./.env; set +a
+export GATEWAY_TEST_API_KEY
 uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
