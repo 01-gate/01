@@ -60,7 +60,8 @@ class FakeUpstream:
     """Минимальное ASGI-приложение вместо NanoGPT; mode меняется на лету."""
 
     def __init__(self):
-        self.mode = "ok"  # ok | http_500 | malformed | sync_no_usage | stream_no_usage
+        self.mode = "ok"  # ok | http_500 | http_status | malformed | sync_no_usage | stream_no_usage
+        self.status = 500  # используется в режиме http_status
         self.stream_delay = 0.0
         self.requests = []  # {"path":..., "headers":..., "payload":...}
 
@@ -79,18 +80,10 @@ class FakeUpstream:
             {"path": scope["path"], "headers": headers, "payload": payload}
         )
         if self.mode == "http_500":
-            message = b'SECRET_UPSTREAM_RAW_BODY'
-            await send(
-                {
-                    "type": "http.response.start",
-                    "status": 500,
-                    "headers": [
-                        (b"content-type", b"text/plain"),
-                        (b"x-request-id", b"req_ERR"),
-                    ],
-                }
-            )
-            await send({"type": "http.response.body", "body": message})
+            await self._send_error(send, 500)
+            return
+        if self.mode == "http_status":
+            await self._send_error(send, self.status)
             return
         if self.mode == "malformed":
             await send(
@@ -159,6 +152,20 @@ class FakeUpstream:
                 "body": json.dumps(SYNC_BODY).encode(),
             }
         )
+
+    async def _send_error(self, send, status: int):
+        # тело с секретом: не должно утечь клиенту/в логи (§4.2.A.4)
+        await send(
+            {
+                "type": "http.response.start",
+                "status": status,
+                "headers": [
+                    (b"content-type", b"text/plain"),
+                    (b"x-request-id", b"req_ERR"),
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": b"SECRET_UPSTREAM_RAW_BODY"})
 
 
 class BoomTransport(httpx.AsyncBaseTransport):
@@ -433,6 +440,39 @@ def test_stream_client_disconnect_no_retry(fake):
     assert len(fake.requests) == 1  # повтора генерации не было
 
 
+def test_client_disconnect_closes_upstream_resources(fake, monkeypatch):
+    # §4.5.8/§9: отключение клиента до конца потока закрывает upstream-ресурсы
+    closed = []
+
+    class TrackedClient(httpx.AsyncClient):
+        async def aclose(self):
+            closed.append(True)
+            await super().aclose()
+
+    def factory():
+        return TrackedClient(
+            transport=httpx.ASGITransport(app=fake), base_url=NANO_BASE
+        )
+
+    monkeypatch.setattr(nanogpt, "_client", factory)
+
+    async def go():
+        gen = await nanogpt.run_chat(
+            "xiaomi/mimo-v2.6-flash",
+            [{"role": "user", "content": "hi"}],
+            True,
+            False,
+            {},
+            nanogpt.UpstreamMeta(),
+        )
+        first = await anext(gen)
+        await gen.aclose()  # отключение клиента до штатного конца
+        assert first
+
+    asyncio.run(go())
+    assert closed == [True]  # клиент upstream закрыт ровно один раз
+
+
 # §10.3.15 ошибки
 
 
@@ -474,6 +514,165 @@ def test_timeout_maps_to_504_without_retry(monkeypatch):
     assert r.status_code == 504
     assert r.json()["error"]["code"] == "upstream_timeout"
     assert len(calls) == 1  # слепого повтора не было
+
+
+def test_connect_timeout_maps_to_504_not_502(monkeypatch):
+    # SPEC_005 дефект №3: ConnectTimeout — таймаут, а не ошибка соединения
+    _patch_transport(monkeypatch, httpx.ConnectTimeout("slow"))
+    r = _chat(model="01", messages=[{"role": "user", "content": "hi"}])
+    assert r.status_code == 504
+    assert r.json()["error"]["code"] == "upstream_timeout"
+
+
+# §5.3 SPEC_005: классификация всех таймаутов — явные непересекающиеся правила
+
+
+def test_classify_all_timeout_types_and_connect_error():
+    for exc in (
+        httpx.ConnectTimeout("t"),
+        httpx.ReadTimeout("t"),
+        httpx.WriteTimeout("t"),
+        httpx.PoolTimeout("t"),
+    ):
+        assert nanogpt._classify(exc).kind == "timeout", type(exc).__name__
+    assert nanogpt._classify(httpx.ConnectError("refused")).kind == "connect"
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [httpx.ConnectTimeout("t"), httpx.ReadTimeout("t"), httpx.WriteTimeout("t"), httpx.PoolTimeout("t")],
+)
+def test_all_timeout_types_map_to_504(monkeypatch, exc):
+    # публичный статус: любой таймаут до начала ответа — 504, без сети
+    _patch_transport(monkeypatch, exc)
+    r = _chat(model="01", messages=[{"role": "user", "content": "hi"}])
+    assert r.status_code == 504
+    assert r.json()["error"]["code"] == "upstream_timeout"
+
+
+def test_write_and_pool_timeout_classified_as_timeout():
+    # отдельная проверка бывших «серых» типов (§5.2 особая обработка объяснимо)
+    assert nanogpt._classify(httpx.WriteTimeout("t")).kind == "timeout"
+    assert nanogpt._classify(httpx.PoolTimeout("t")).kind == "timeout"
+
+
+# §4.5 SPEC_005: ошибки upstream до начала ответа клиенту
+
+
+def _stream_chat():
+    return request(
+        "POST",
+        "/v1/chat/completions",
+        headers=AUTH,
+        json={"model": "01", "messages": [{"role": "user", "content": "hi"}], "stream": True},
+    )
+
+
+@pytest.mark.parametrize("bad_status", [401, 429, 500])
+def test_stream_upstream_error_before_body_is_gateway_error(fake, bad_status):
+    # §4.5.1–2: ответ ошибочной стадии до начала передачи — настоящий
+    # HTTP-статус gateway (502), а не 200 с обрывом; тело не раскрывается
+    fake.mode = "http_status"
+    fake.status = bad_status
+    r = _stream_chat()
+    assert r.status_code == 502
+    assert r.json()["error"]["code"] == "upstream_error"
+    assert "SECRET_UPSTREAM_RAW_BODY" not in r.text
+    assert not r.headers["content-type"].startswith("text/event-stream")
+    assert len(fake.requests) == 1  # второй запрос ради предпроверки не открывался
+
+
+def test_stream_connect_error_before_body_returns_502(monkeypatch):
+    # §4.5.3: ошибка соединения до ответа — 502, не 200 с пустым потоком
+    _patch_transport(monkeypatch, httpx.ConnectError("refused"))
+    r = _stream_chat()
+    assert r.status_code == 502
+    assert r.json()["error"]["code"] == "upstream_unavailable"
+
+
+def test_stream_connect_timeout_before_body_returns_504(monkeypatch):
+    calls = []
+
+    def factory():
+        calls.append(1)
+        return httpx.AsyncClient(
+            transport=BoomTransport(httpx.ConnectTimeout("slow")), base_url=NANO_BASE
+        )
+
+    monkeypatch.setattr(nanogpt, "_client", factory)
+    r = _stream_chat()
+    assert r.status_code == 504
+    assert r.json()["error"]["code"] == "upstream_timeout"
+    assert len(calls) == 1  # без повтора
+
+
+# §4.4.5/§4.2.B: ошибка после начала передачи (реальный сокет:
+# httpx.ASGITransport буферизует ответ upstream и не воспроизводит обрыв)
+
+
+def test_stream_error_after_start_ends_without_fake_done(monkeypatch, caplog):
+    caplog.set_level(logging.INFO, logger="gateway")
+    up_port = _free_port()
+    gw_port = _free_port()
+
+    async def raw_upstream(reader, writer):
+        head = await reader.readuntil(b"\r\n\r\n")
+        length = 0
+        for line in head.decode(errors="ignore").split("\r\n"):
+            if line.lower().startswith("content-length:"):
+                length = int(line.split(":", 1)[1])
+        if length:
+            await reader.readexactly(length)
+        # штатное начало + одно событие, затем обрыв заявленной длины (§4.2.B.6)
+        writer.write(
+            b"HTTP/1.1 200 OK\r\n"
+            b"content-type: text/event-stream\r\n"
+            b"content-length: 500\r\n\r\n"
+            b'data: {"id": "chatcmpl-up-1", "object": "x"}\n\n'
+        )
+        await writer.drain()
+        writer.close()
+
+    def factory():
+        return httpx.AsyncClient(base_url=f"http://127.0.0.1:{up_port}")
+
+    async def go():
+        up_server = await asyncio.start_server(raw_upstream, "127.0.0.1", up_port)
+        gw_server, gw_task = await _start_server(gw.app, gw_port)
+        try:
+            status, got = None, []
+            async with httpx.AsyncClient(
+                base_url=f"http://127.0.0.1:{gw_port}", timeout=10.0
+            ) as client:
+                async with client.stream(
+                    "POST",
+                    "/v1/chat/completions",
+                    headers=AUTH,
+                    json={
+                        "model": "01",
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "stream": True,
+                    },
+                ) as r:
+                    status = r.status_code
+                    async for line in r.aiter_lines():
+                        if line.startswith("data: "):
+                            got.append(line[6:])
+            return status, got
+        finally:
+            up_server.close()
+            await up_server.wait_closed()
+            gw_server.should_exit = True
+            await gw_task
+
+    monkeypatch.setattr(nanogpt, "_client", factory)
+    monkeypatch.setenv("NANOGPT_INFERENCE_BASE_URL", f"http://127.0.0.1:{up_port}")
+    status, got = asyncio.run(go())
+    assert status == 200  # статус уже отправлен, поменять нельзя
+    assert got and got[0].startswith('{"id": "chatcmpl-up-1"')  # событие дошло
+    assert "[DONE]" not in got  # поток обрывается честно, без подделки
+    line = [l for l in caplog.messages if l.startswith("chat method=POST")][-1]
+    assert not line.rstrip().endswith("error=-")  # состояние зафиксировано в логе
 
 
 def test_malformed_upstream_response(fake):

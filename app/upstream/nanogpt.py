@@ -97,8 +97,7 @@ def _build_payload(
 
 
 def _classify(exc: Exception) -> UpstreamError:
-    if isinstance(exc, httpx.ConnectError | httpx.ConnectTimeout):
-        return UpstreamError("connect", detail=type(exc).__name__)
+    # ConnectTimeout — таймаут, а не ошибка соединения: 504, не 502 (SPEC_005 §4.4)
     if isinstance(exc, httpx.TimeoutException):
         return UpstreamError("timeout", detail=type(exc).__name__)
     if isinstance(exc, httpx.HTTPError):
@@ -141,11 +140,57 @@ async def run_chat(
 ) -> dict[str, Any] | AsyncIterator[str]:
     payload = _build_payload(upstream_model, messages, stream, include_usage, extra)
     started = time.monotonic()
-    if stream:
-        # клиент создаётся внутри генератора: живёт до конца итерации потока
-        return _stream(payload, meta, started)
-    async with _client() as client:
-        return await _sync(client, payload, meta, started)
+    if not stream:
+        async with _client() as client:
+            return await _sync(client, payload, meta, started)
+    # Стадия A (SPEC_005 §4.2): upstream-запрос открыт и проверен ДО ответа
+    # клиенту, поэтому 401/429/500/таймаут соединения здесь дают 502/504,
+    # а не 200 с обрывом. Запрос один и тот же: второй раз не открывается (§4.3).
+    client = _client()
+    try:
+        request = client.build_request(
+            "POST", "/chat/completions", json=payload, headers=_upstream_headers()
+        )
+        response = await client.send(request, stream=True)
+    except httpx.HTTPError as exc:
+        err = _classify(exc)
+        meta.error = err.kind
+        await client.aclose()
+        raise err from None
+    except Exception as exc:
+        # неожиданный сбой до ответа клиенту: типизированная 502/504 (§4.4)
+        err = _classify(exc)
+        meta.error = err.kind
+        await client.aclose()
+        raise err from None
+    if response.status_code >= 400:
+        await _discard_error_body(response)
+        meta.upstream_status = response.status_code
+        meta.error = f"http_{response.status_code}"
+        await response.aclose()
+        await client.aclose()
+        raise UpstreamError(
+            "http", status=response.status_code, detail=str(response.status_code)
+        )
+    meta.upstream_status = response.status_code
+    rid = response.headers.get("x-request-id")
+    if rid:
+        meta.upstream_request_id = rid
+    # Стадия B: трансляция уже открытого потока; ресурсы закрывает finally генератора
+    return _stream(client, response, payload, meta, started)
+
+
+async def _discard_error_body(response: httpx.Response, limit: int = 8192) -> None:
+    # читается только ограниченная часть, нужная чтобы закрыть соединение;
+    # тело не сохраняется и не логируется (SPEC_005 §4.2.A.4)
+    got = 0
+    try:
+        async for chunk in response.aiter_bytes():
+            got += len(chunk)
+            if got >= limit:
+                break
+    except httpx.HTTPError:
+        pass
 
 
 async def _sync(
@@ -179,35 +224,20 @@ async def _sync(
 
 
 async def _stream(
-    payload: dict[str, Any], meta: UpstreamMeta, started: float
+    client: httpx.AsyncClient,
+    response: httpx.Response,
+    payload: dict[str, Any],
+    meta: UpstreamMeta,
+    started: float,
 ) -> AsyncIterator[str]:
-    """Отдаёт SSE data-payload'ы без 'data: ' префикса; сам [DONE] не дублирует.
+    """Стадия B (SPEC_005 §4.3): транслирует уже открытый upstream-ответ.
 
-    Прокидывает события в исходном порядке, без буферизации (§6).
+    Отдаёт SSE data-payload'ы без 'data: ' префикса; сам [DONE] не дублирует.
+    Прокидывает события в исходном порядке, без буферизации. Ошибка после
+    начала передачи честно обрывает поток: новый статус невозможен (§4.4).
     """
     events: AsyncIterator[str]
-    client = _client()
     try:
-        request = client.build_request(
-            "POST", "/chat/completions", json=payload, headers=_upstream_headers()
-        )
-        response = await client.send(request, stream=True)
-    except httpx.HTTPError as exc:
-        err = _classify(exc)
-        meta.error = err.kind
-        raise err from None
-    try:
-        if response.status_code >= 400:
-            await response.aread()
-            meta.upstream_status = response.status_code
-            meta.error = f"http_{response.status_code}"
-            raise UpstreamError(
-                "http", status=response.status_code, detail=str(response.status_code)
-            )
-        meta.upstream_status = response.status_code
-        rid = response.headers.get("x-request-id")
-        if rid:
-            meta.upstream_request_id = rid
         events = response.aiter_lines()
         async for line in events:
             if not line:
@@ -240,6 +270,12 @@ async def _stream(
         raise
     except httpx.HTTPError as exc:
         # обрыв после 200: состояние потока неизвестно, повтор запрещён (§6)
+        err = _classify(exc)
+        meta.error = err.kind
+        raise err from None
+    except Exception as exc:
+        # неожиданный сбой после начала передачи: статус уже отправлен,
+        # обрываем поток с типизированной ошибкой, а не выём горох (§4.4)
         err = _classify(exc)
         meta.error = err.kind
         raise err from None
