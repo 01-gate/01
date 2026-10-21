@@ -187,7 +187,10 @@ async def chat_completions(request: Request):
         base_log
         + " status=%s response_id=%s upstream_request_id=%s billing_lookup_id=%s"
         " upstream_status=%s usage=%s events=%s duration_ms=%s"
-        " response_open_ms=%s first_event_ms=%s first_text_ms=%s max_event_gap_ms=%s"
+        " response_open_ms=%s first_event_ms=%s first_text_ms=%s"
+        " first_tool_call_ms=%s tool_call_events=%s tool_call_fragments=%s"
+        " first_reasoning_ms=%s reasoning_events=%s max_event_gap_ms=%s"
+        " sse_event_types=%s delta_keys=%s upstream_fields=%s"
         " error_detail=%s error=%s"
     )
 
@@ -207,7 +210,15 @@ async def chat_completions(request: Request):
                 meta.response_open_ms if meta.response_open_ms is not None else "-",
                 meta.first_event_ms if meta.first_event_ms is not None else "-",
                 meta.first_text_ms if meta.first_text_ms is not None else "-",
+                meta.first_tool_call_ms if meta.first_tool_call_ms is not None else "-",
+                meta.tool_call_events,
+                meta.tool_call_fragments,
+                meta.first_reasoning_ms if meta.first_reasoning_ms is not None else "-",
+                meta.reasoning_events,
                 meta.max_event_gap_ms,
+                ",".join(f"{k}:{v}" for k, v in sorted(meta.sse_event_types.items())) or "-",
+                ",".join(f"{k}:{v}" for k, v in sorted(meta.delta_key_counts.items())) or "-",
+                meta.extra.get("upstream_fields", "-"),
                 meta.error_detail or "-",
                 error,
             )

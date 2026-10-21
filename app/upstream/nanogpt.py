@@ -66,7 +66,14 @@ class UpstreamMeta:
     response_open_ms: int | None = None
     first_event_ms: int | None = None
     first_text_ms: int | None = None
+    first_tool_call_ms: int | None = None
+    first_reasoning_ms: int | None = None
     max_event_gap_ms: int = 0
+    tool_call_events: int = 0
+    tool_call_fragments: int = 0
+    reasoning_events: int = 0
+    delta_key_counts: dict[str, int] = field(default_factory=dict)
+    sse_event_types: dict[str, int] = field(default_factory=dict)
     error: str | None = None
     error_detail: str | None = None
     events: int = 0
@@ -151,6 +158,8 @@ async def run_chat(
     meta: UpstreamMeta,
 ) -> dict[str, Any] | AsyncIterator[str]:
     payload = _build_payload(upstream_model, messages, stream, include_usage, extra)
+    # Record only field names, never values, to verify the actual upstream contract.
+    meta.extra["upstream_fields"] = ",".join(sorted(payload))
     started = time.monotonic()
     if not stream:
         async with _client() as client:
@@ -255,17 +264,32 @@ async def _stream(
     """
     events: AsyncIterator[str]
     last_event_at: float | None = None
+    current_sse_event = "message"
     try:
         events = response.aiter_lines()
         async for line in events:
             if not line:
+                current_sse_event = "message"
+                continue
+            if line.startswith(":"):
+                continue  # SSE-комментарий keep-alive
+            if line.startswith("event:"):
+                candidate = line[6:].strip()
+                # Do not let arbitrary upstream strings become log fields.
+                safe_type = "".join(c for c in candidate[:40] if c.isalnum() or c in "_-.")
+                current_sse_event = safe_type or "message"
+                continue
+            if line.startswith("id:") or line.startswith("retry:"):
                 continue
             if not line.startswith("data:"):
-                continue  # event:/id:/retry:/комментарии — в контракт не входят
+                continue
+            event_type = current_sse_event
             data = line[5:].strip()
             if data == "[DONE]":
                 # main добавляет единственный финальный [DONE]
                 continue
+            meta.sse_event_types[event_type] = meta.sse_event_types.get(event_type, 0) + 1
+            current_sse_event = "message"
             try:
                 chunk = json.loads(data)
             except ValueError:
@@ -283,15 +307,33 @@ async def _stream(
             last_event_at = now
             if isinstance(chunk, dict):
                 _collect_json_ids(chunk, response.headers, meta)
-                # TTFT измеряем по первому непустому текстовому delta,
-                # а не по служебному role/tool/finish_reason чанку.
-                if meta.first_text_ms is None:
-                    for choice in chunk.get("choices", []):
-                        delta = choice.get("delta", {}) if isinstance(choice, dict) else {}
-                        content = delta.get("content") if isinstance(delta, dict) else None
-                        if isinstance(content, str) and content:
-                            meta.first_text_ms = elapsed_ms
-                            break
+                # Metrics inspect only delta shape and field names, never content.
+                for choice in chunk.get("choices", []):
+                    if not isinstance(choice, dict):
+                        continue
+                    delta = choice.get("delta", {})
+                    if not isinstance(delta, dict):
+                        continue
+                    for key in delta:
+                        # Delta keys are metadata too: bound and sanitize them before logging.
+                        safe_key = "".join(
+                            c for c in str(key)[:40] if c.isalnum() or c in "_-."
+                        ) or "other"
+                        meta.delta_key_counts[safe_key] = meta.delta_key_counts.get(safe_key, 0) + 1
+                    content = delta.get("content")
+                    if meta.first_text_ms is None and isinstance(content, str) and content:
+                        meta.first_text_ms = elapsed_ms
+                    tool_calls = delta.get("tool_calls")
+                    if isinstance(tool_calls, list) and tool_calls:
+                        meta.tool_call_events += 1
+                        meta.tool_call_fragments += len(tool_calls)
+                        if meta.first_tool_call_ms is None:
+                            meta.first_tool_call_ms = elapsed_ms
+                    reasoning_keys = {"reasoning", "reasoning_content", "analysis", "thinking"}
+                    if any(key in delta and delta[key] not in (None, "", [], {}) for key in reasoning_keys):
+                        meta.reasoning_events += 1
+                        if meta.first_reasoning_ms is None:
+                            meta.first_reasoning_ms = elapsed_ms
                 rate = chunk.pop("x_nanogpt_pricing", None)
                 if isinstance(rate, dict) and isinstance(rate.get("requestId"), str):
                     meta.billing_lookup_id = rate["requestId"]

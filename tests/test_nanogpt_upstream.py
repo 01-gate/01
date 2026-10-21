@@ -294,6 +294,26 @@ def test_sync_proxied_with_separate_ids(fake, caplog):
     assert fake.requests[0]["path"] == "/v1/chat/completions"
 
 
+def test_forwarded_parameters_are_explicit_and_reasoning_effort_is_not_forwarded(fake):
+    # Input logs show fields sent by the client; this asserts the actual upstream payload.
+    r = _chat(
+        model="01",
+        messages=[{"role": "user", "content": "hi"}],
+        temperature=0.2,
+        max_completion_tokens=123,
+        reasoning_effort="high",
+        unsupported_client_option="not-forwarded",
+    )
+    assert r.status_code == 200
+    sent = fake.requests[-1]["payload"]
+    assert sent["temperature"] == 0.2
+    assert sent["max_completion_tokens"] == 123
+    assert "reasoning_effort" not in sent
+    assert "unsupported_client_option" not in sent
+    assert "messages" in sent and "model" in sent
+    assert set(sent) == {"model", "messages", "temperature", "max_completion_tokens"}
+
+
 def test_tool_calling_fields_forwarded_to_upstream(fake):
     tools = [
         {
@@ -342,7 +362,8 @@ def test_tool_calling_fields_forwarded_to_upstream(fake):
     assert sent["messages"] == messages
 
 
-def test_stream_tool_call_delta_is_preserved(fake):
+def test_stream_tool_call_delta_is_preserved(fake, caplog):
+    caplog.set_level(logging.INFO, logger="gateway")
     fake.mode = "tool_stream"
     r = _chat(
         model="01",
@@ -370,6 +391,11 @@ def test_stream_tool_call_delta_is_preserved(fake):
     assert tool_chunks
     assert tool_chunks[0]["function"]["name"] == "read_file"
     assert events[-1] == "[DONE]"
+    line = [l for l in caplog.messages if l.startswith("chat method=POST")][-1]
+    assert "tool_call_events=1" in line
+    assert "tool_call_fragments=1" in line
+    assert "first_tool_call_ms=" in line
+    assert "TOP_SECRET" not in line
 
 
 def test_usage_base_url_never_used(fake):
@@ -827,6 +853,14 @@ def test_stream_normal_final_log_separates_states(fake, caplog):
     assert "first_event_ms=" in line
     assert "first_text_ms=" in line
     assert "max_event_gap_ms=" in line
+    assert "first_tool_call_ms=" in line
+    assert "tool_call_events=0" in line
+    assert "tool_call_fragments=0" in line
+    assert "first_reasoning_ms=" in line
+    assert "reasoning_events=0" in line
+    assert "sse_event_types=message:2" in line
+    assert "delta_keys=content:2,role:1" in line
+    assert "upstream_fields=" in line
     assert "error_detail=-" in line
 
 
