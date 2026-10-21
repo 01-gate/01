@@ -37,10 +37,53 @@ async def health() -> dict[str, str]:
 @app.get("/v1/models")
 async def list_models() -> dict:
     # shortcut: каталог захардкожен (одна модель), заменить на реестр при маппинге public->upstream ID
+    now = int(time.time())
     return {
         "object": "list",
         "data": [
-            {"id": "01", "object": "model", "created": int(time.time()), "owned_by": "local"},
+            {
+                "id": "01",
+                "object": "model",
+                "created": now,
+                "owned_by": "local",
+                "name": "Local Stub 01",
+                "description": (
+                    "Local gateway stub model for OpenCode. "
+                    "No upstream call; returns deterministic fake completions."
+                ),
+                "context_length": 128000,
+                "max_output_tokens": 8192,
+                "architecture": {
+                    "modality": "text->text",
+                    "input_modalities": ["text"],
+                    "output_modalities": ["text"],
+                },
+                "capabilities": {
+                    "vision": False,
+                    "video_input": False,
+                    "audio_input": False,
+                    "reasoning": False,
+                    "tool_calling": True,
+                    "parallel_tool_calls": False,
+                    "structured_output": False,
+                    "pdf_upload": False,
+                    "batch_api": False,
+                },
+                "reasoning_efforts": [],
+                "supported_service_tiers": [],
+                "supported_batch_endpoints": [],
+                "pricing": {
+                    "prompt": 1.00,
+                    "completion": 2.50,
+                    "cacheReadInputPer1kTokens": 0.00025,
+                    "cacheWriteInputPer1kTokens": 0.00050,
+                    "currency": "RUB",
+                    "unit": "per_million_tokens"
+                },
+                "cost_estimate": 0.020,
+                "category": "Local",
+                "providers": ["local"],
+            }
         ],
     }
 
