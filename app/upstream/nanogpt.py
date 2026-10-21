@@ -26,6 +26,8 @@ logger = logging.getLogger("gateway.upstream")
 # отбрасывается: умолчания upstream, инструкции (§5.2 «только нужные поля»).
 FORWARD_FIELDS = (
     "stream_options",
+    "reasoning_effort",
+    "reasoning",
     "tools",
     "tool_choice",
     "parallel_tool_calls",
@@ -74,6 +76,7 @@ class UpstreamMeta:
     reasoning_events: int = 0
     delta_key_counts: dict[str, int] = field(default_factory=dict)
     sse_event_types: dict[str, int] = field(default_factory=dict)
+    finish_reason_counts: dict[str, int] = field(default_factory=dict)
     error: str | None = None
     error_detail: str | None = None
     events: int = 0
@@ -311,6 +314,15 @@ async def _stream(
                 for choice in chunk.get("choices", []):
                     if not isinstance(choice, dict):
                         continue
+                    finish_reason = choice.get("finish_reason")
+                    if isinstance(finish_reason, str):
+                        # Log only recognized protocol labels; arbitrary provider text is not a log field.
+                        safe_finish_reason = finish_reason if finish_reason in {
+                            "stop", "length", "tool_calls", "function_call", "content_filter"
+                        } else "other"
+                        meta.finish_reason_counts[safe_finish_reason] = (
+                            meta.finish_reason_counts.get(safe_finish_reason, 0) + 1
+                        )
                     delta = choice.get("delta", {})
                     if not isinstance(delta, dict):
                         continue
