@@ -63,7 +63,12 @@ class UpstreamMeta:
     usage_seen: bool = False
     upstream_status: int | None = None
     duration_ms: int = 0
+    response_open_ms: int = 0
+    first_event_ms: int | None = None
+    first_text_ms: int | None = None
+    max_event_gap_ms: int = 0
     error: str | None = None
+    error_detail: str | None = None
     events: int = 0
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -183,6 +188,7 @@ async def run_chat(
             "http", status=response.status_code, detail=str(response.status_code)
         )
     meta.upstream_status = response.status_code
+    meta.response_open_ms = meta.duration_ms
     rid = response.headers.get("x-request-id")
     if rid:
         meta.upstream_request_id = rid
@@ -248,6 +254,7 @@ async def _stream(
     начала передачи честно обрывает поток: новый статус невозможен (§4.4).
     """
     events: AsyncIterator[str]
+    last_event_at: float | None = None
     try:
         events = response.aiter_lines()
         async for line in events:
@@ -266,8 +273,25 @@ async def _stream(
                 meta.extra["non_json_data"] = True
                 yield data
                 continue
+            now = time.monotonic()
+            elapsed_ms = int((now - started) * 1000)
+            if meta.first_event_ms is None:
+                meta.first_event_ms = elapsed_ms
+            if last_event_at is not None:
+                gap_ms = int((now - last_event_at) * 1000)
+                meta.max_event_gap_ms = max(meta.max_event_gap_ms, gap_ms)
+            last_event_at = now
             if isinstance(chunk, dict):
                 _collect_json_ids(chunk, response.headers, meta)
+                # TTFT измеряем по первому непустому текстовому delta,
+                # а не по служебному role/tool/finish_reason чанку.
+                if meta.first_text_ms is None:
+                    for choice in chunk.get("choices", []):
+                        delta = choice.get("delta", {}) if isinstance(choice, dict) else {}
+                        content = delta.get("content") if isinstance(delta, dict) else None
+                        if isinstance(content, str) and content:
+                            meta.first_text_ms = elapsed_ms
+                            break
                 rate = chunk.pop("x_nanogpt_pricing", None)
                 if isinstance(rate, dict) and isinstance(rate.get("requestId"), str):
                     meta.billing_lookup_id = rate["requestId"]
@@ -282,12 +306,14 @@ async def _stream(
         # обрыв после 200: состояние потока неизвестно, повтор запрещён (§6)
         err = _classify(exc)
         meta.error = err.kind
+        meta.error_detail = err.detail or type(exc).__name__
         raise err from None
     except Exception as exc:
         # неожиданный сбой после начала передачи: статус уже отправлен,
         # обрываем поток с типизированной ошибкой, а не выём горох (§4.4)
         err = _classify(exc)
         meta.error = err.kind
+        meta.error_detail = err.detail or type(exc).__name__
         raise err from None
     finally:
         # длительность фиксируется при любом исходе: обрыв не должен маскироваться нулём
