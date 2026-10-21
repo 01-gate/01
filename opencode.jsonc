@@ -1,6 +1,6 @@
 {
   "$schema": "https://opencode.ai/config.json",
-  "model": "xiaomi/mimo-v2.6-flash",
+  "model": "local/01",
   "provider": {
     "local": {
       "npm": "@ai-sdk/openai-compatible",
