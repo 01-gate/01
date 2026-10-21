@@ -1,0 +1,31 @@
+{
+  "model": "01",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Use the lookup_record tool to look up record ID demo-17. Do not answer without calling the tool."
+    }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "lookup_record",
+        "description": "Look up a record by identifier. Do not invent lookup results.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "record_id": {
+              "type": "string",
+              "description": "Identifier of the record to look up."
+            }
+          },
+          "required": ["record_id"],
+          "additionalProperties": false
+        }
+      }
+    }
+  ],
+  "tool_choice": "required",
+  "max_completion_tokens": 512
+}
