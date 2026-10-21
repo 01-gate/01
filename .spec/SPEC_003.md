@@ -155,7 +155,7 @@ done
 3. Установить точный ID в shell-переменную, не меняя регистр и не подставляя alias нашего gateway.
 
 ```bash
-export NANOGPT_MODEL_ID='<EXACT_MODEL_ID_FROM_LIVE_CATALOG>'
+export NANOGPT_MODEL_ID='xiaomi/mimo-v2.6-flash'
 test -n "$NANOGPT_MODEL_ID" || { echo 'Model ID is missing'; exit 1; }
 ```
 
