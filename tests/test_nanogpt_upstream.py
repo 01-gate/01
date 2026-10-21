@@ -138,7 +138,7 @@ class FakeUpstream:
                                                 "type": "function",
                                                 "function": {
                                                     "name": "read_file",
-                                                    "arguments": "{\\"path\\":",
+                                                    "arguments": '{"path":',
                                                 },
                                             }
                                         ]
@@ -320,7 +320,7 @@ def test_tool_calling_fields_forwarded_to_upstream(fake):
                     "type": "function",
                     "function": {
                         "name": "read_file",
-                        "arguments": "{\\"path\\":\\"README.md\\"}",
+                        "arguments": json.dumps({"path": "README.md"}),
                     },
                 }
             ],
