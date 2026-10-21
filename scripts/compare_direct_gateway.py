@@ -19,7 +19,7 @@ from typing import Any
 import httpx
 
 UPSTREAM_MODEL = "xiaomi/mimo-v2.6-flash"
-DEFAULT_NANOGPT_BASE = "https://api.nano-gpt.com/v1"
+DEFAULT_NANOGPT_BASE = "https://nano-gpt.com/api/v1"
 DEFAULT_GATEWAY_BASE = "http://127.0.0.1:8000/v1"
 MAX_BODY_BYTES = 128 * 1024
 MAX_OUTPUT_TOKENS = 1024
@@ -146,6 +146,9 @@ async def run_one(
         "request_id": None,
         "done_seen": False,
         "error_type": None,
+        "upstream_error_code": None,
+        "upstream_error_type": None,
+        "upstream_error_param": None,
         "_started": time.monotonic(),
     }
     started = result["_started"]
@@ -166,6 +169,30 @@ async def run_one(
                 result["request_id"] = response.headers.get("x-request-id")
                 if response.status_code < 200 or response.status_code >= 300:
                     result["error_type"] = "http_error"
+                    # Capture only structured error identifiers, never raw body/message.
+                    body = bytearray()
+                    async for part in response.aiter_bytes():
+                        remaining = 16 * 1024 - len(body)
+                        if remaining <= 0:
+                            break
+                        body.extend(part[:remaining])
+                    try:
+                        error_doc = json.loads(body)
+                    except (ValueError, TypeError):
+                        error_doc = {}
+                    if isinstance(error_doc, dict):
+                        err = error_doc.get("error")
+                        if isinstance(err, dict):
+                            code = err.get("code")
+                            err_type = err.get("type")
+                            param = err.get("param")
+                        else:
+                            code = err if isinstance(err, str) else None
+                            err_type = error_doc.get("type")
+                            param = error_doc.get("param")
+                        result["upstream_error_code"] = code if isinstance(code, str) else None
+                        result["upstream_error_type"] = err_type if isinstance(err_type, str) else None
+                        result["upstream_error_param"] = param if isinstance(param, str) else None
                     return _clean_result(result)
 
                 data_lines: list[str] = []
