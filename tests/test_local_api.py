@@ -14,6 +14,8 @@ AUTH = {"Authorization": f"Bearer {TEST_KEY}"}
 @pytest.fixture(autouse=True)
 def _env(monkeypatch):
     monkeypatch.setenv("GATEWAY_TEST_API_KEY", TEST_KEY)
+    # этот файл проверяет legacy stub-режим (SPEC_004 §2.11)
+    monkeypatch.setenv("GATEWAY_UPSTREAM", "stub")
 
 
 def request(method, path, **kwargs):
@@ -38,13 +40,16 @@ def test_health():
 
 
 def test_models_without_auth():
-    assert request("GET", "/v1/models").status_code == 401
+    # публичный endpoint без авторизации (SPEC_004 §4.1)
+    r = request("GET", "/v1/models")
+    assert r.status_code == 200
+    assert r.json()["object"] == "list"
 
 
-def test_models_wrong_key():
+def test_models_arbitrary_key_still_public():
     r = request("GET", "/v1/models", headers={"Authorization": "Bearer wrong"})
-    assert r.status_code == 401
-    assert r.json()["error"]["code"] == "invalid_api_key"
+    assert r.status_code == 200
+    assert any(m["id"] == "01" for m in r.json()["data"])
 
 
 def test_models_ok():

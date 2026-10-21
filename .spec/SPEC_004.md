@@ -2,7 +2,7 @@
 
 **Версия:** 1.1  
 **Дата:** 2026-10-21  
-**Статус:** согласованная спецификация для реализации  
+**Статус:** реализовано, отчёт см. §15  
 **Область:** минимальный FastAPI gateway с реальным NanoGPT upstream, без биллинга и PostgreSQL на этом этапе.
 
 ## 1. Цель
@@ -288,3 +288,75 @@ NANOGPT_TIMEOUT_SECONDS=90
 3. Поведение streaming, финального usage и pricing может отличаться между моделями. Не полагаться на единственный пример как на универсальный контракт.
 4. Локальный `GATEWAY_TEST_API_KEY` не является полноценной системой клиентских ключей. Его простота намеренна для первого среза; хранение хешей, отзыв, scopes и lifecycle ключей проектируются отдельным этапом.
 5. Эта реализация не является финансово безопасным публичным платным gateway, поскольку резервирование средств, идемпотентность биллинга и reconciliation сознательно отложены.
+
+## 15. Отчёт об изменениях
+
+Дата выполнения: 2026-10-21. Работа велась в песочнице `/tmp/opencode/spec004`, по апруву применения скопирована в проект; песочница и её процессы удалены.
+
+### 15.1. Изменённые файлы
+
+Новые:
+
+- `app/config.py` — загрузка `.env` (только `NANOGPT_*` / `GATEWAY_*`), fail-fast `ConfigError` без вывода секретов, `SystemExit(2)` при запуске без обязательных настроек;
+- `app/upstream/nanogpt.py` — адаптер: sync, SSE-прокси, `FORWARD_FIELDS` allowlist, stripe `x_nanogpt_pricing`, `UpstreamMeta` с тремя раздельными ID, `UpstreamError` → 502/504, ноль retry;
+- `tests/test_config.py`, `tests/test_nanogpt_upstream.py` — тесты конфигурации, mock-upstream (`FakeUpstream`), протокола и логов;
+- `.env.example` — шаблон настроек.
+
+Изменённые:
+
+- `app/main.py` — `GATEWAY_UPSTREAM=stub|nanogpt`, публичный `GET /v1/models`, nano-ветка прокси с единым `nano_log` (три ID отдельно), убраны `print()`;
+- `tests/test_local_api.py` — `/v1/models` без auth → 200 (§4.1), автouse-фикстура `GATEWAY_UPSTREAM=stub`;
+- `README.md` — запуск без `export`, публичность каталога, ошибки 502/504, режим stub;
+- `.env` — `NANOGPT_BASE_URL` → `NANOGPT_INFERENCE_BASE_URL`, добавлены `GATEWAY_UPSTREAM=nanogpt`, `NANOGPT_TIMEOUT_SECONDS=90`;
+- `.spec/SPEC_002.md` — согласованы противоречия по публичности `GET /v1/models` (§12).
+
+Не тронуто (вне рамок спеки): `opencode.jsonc`, `HANDOFF.md`, `AGENTS.md`, `app/upstream/stub.py`.
+
+### 15.2. Реальные команды и результаты тестов
+
+```text
+$ cd /home/pin/dev/zer0ne.ru && python -m pytest -q
+..................................                                     [100%]
+34 passed in 2.88s
+```
+
+Покрытие §10: 10.1 (публичные маршруты/авторизация), 10.2 (конфигурация, fail-fast subprocess), 10.3 (mock-upstream: путь `/v1/chat/completions` без `/usage`, подпись `Authorization` только своим ключом, маппинг `01` → `xiaomi/mimo-v2.6-flash`, strip pricing, единый `[DONE]`, 401/404/500/timeout/malformed, disconnect → ровно 1 вызов upstream, usage=missing в логе, grep-отсутствие `NANOGPT_USAGE_BASE_URL` в коде), 10.4 (логи без prompts/ключей, caplog+capfd), не-буферизация на реальных сокетах (два in-process uvicorn на эфемерных портах).
+
+### 15.3. Smoke tests против живого NanoGPT
+
+Локальный gateway из песочницы: `uvicorn app.main:app --port 8123` (лог/пид песочницы, порт после работы освобождён — проверено `ss`).
+
+| Проверка | Результат | Статус |
+|---|---|---|
+| `GET /health` | 200 | CONFIRMED BY SMOKE TEST |
+| `GET /v1/models` без авторизации | 200, каталог `{"id":"01"}` | CONFIRMED BY SMOKE TEST |
+| `POST /v1/chat/completions` без ключа | 401, отклонён до upstream | CONFIRMED BY SMOKE TEST |
+| Платный sync (1 вызов) | 200, `usage` prompt=11/completion=8/total=19, `finish_reason=length`, `x_nanogpt_pricing` в выводе отсутствует (grep=0), в логе 3 ID раздельно: `response_id=chatcmpl-15b94135-…`, `upstream_request_id=req_32821b7f-…`, `billing_lookup_id=req_32821b7f-…` | CONFIRMED BY SMOKE TEST |
+| Платный stream (1 вызов) | 5 data-событий, `[DONE]` последним, `usage=seen`, `events=4`, `duration_ms=3697`, `response_id=chatcmpl-3767b411-…`, `upstream_request_id=req_162a3137-…`, grep pricing=0 | CONFIRMED BY SMOKE TEST |
+
+Итого платных вызовов upstream в этом срезе: ровно 2 (1 sync + 1 stream), как требует спека.
+
+### 15.4. Найден и исправлен баг в ходе smoke
+
+Первые две попытки streaming падали: upstream 401. Причина — `client.build_request` в `_stream` создавался без `headers`, ключ NanoGPT не подписан. В отличие от `client.post`, где headers шли явно. Исправлено: `headers=_upstream_headers()` в `build_request`; регрессионный тест `test_upstream_signed_on_stream_too`; добавлено `meta.upstream_status` до раннего raise — диагностика в логе. Отклонённые запросы были бесплатными (upstream 401 до генерации).
+
+### 15.5. Статус критериев §13
+
+- запуск без `export` — да (pytest subprocess-тест + фактический запуск песочницы);
+- `GET /v1/models` без auth — да;
+- неверный ключ → 401 до upstream — да;
+- отдельный inference base + server-side key — да (в `.env`, key только в заголовке upstream);
+- sync и SSE без утечек в логи — да (тесты 10.4);
+- три ID раздельно — да;
+- нет слепой retry, таймаут/disconnect → 504/честный обрыв — да (тест на ровно 1 вызов);
+- тесты stub/mock/API — 34 passed;
+- README и спеки не противоречат — §12 согласовано;
+- этот отчёт — настоящие команды; непроверенное помечено явно.
+
+### 15.6. Непроверенные сценарии и открытые риски
+
+1. Реальные Usage/Request Billing вызовы не выполнялись — `NANOGPT_USAGE_BASE_URL` в срезе по спеке не вызывается (жизнеспособность путей `/api/v1/usage` подтверждена только в SPEC_003 на уровне read-only).
+2. 502/504 против живого upstream не проверялись — только против `FakeUpstream`.
+3. Внешний клиент стрима может буферизовать ответ сам; не-буферизация доказана только для gateway-стороны на реальных сокетах.
+4. `billing_lookup_id` в наблюдавшемся стриме совпал с `X-Request-ID`; `x_nanogpt_pricing.requestId` в чанках стрима не наблюдался — не замалчивается, хранить отдельно (§14.2).
+5. Живой `sk-nano` ключ в `opencode.jsonc` открытым текстом — не исправлено, вне рамок спеки, рекомендуется к отдельной задаче.

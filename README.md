@@ -1,6 +1,8 @@
-# zer0ne local gateway (mock)
+# zer0ne local gateway (NanoGPT)
 
-Локальный OpenAI-compatible API для OpenCode: auth по тестовому ключу, каталог моделей, Chat Completions (sync и SSE stream) со **stub-генерацией**. Внешних HTTP-вызовов нет — NanoGPT не подключён (см. `.spec/SPEC_002.md`).
+Локальный OpenAI-compatible gateway для OpenCode: авторизация клиентским ключом,
+публичный каталог разрешённых моделей, Chat Completions (sync и SSE) через реальный
+upstream **NanoGPT** (см. `.spec/SPEC_004.md`).
 
 ## Запуск
 
@@ -8,26 +10,46 @@
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-set -a; . ./.env; set +a
-export GATEWAY_TEST_API_KEY
+cp .env.example .env   # заполнить ключи
 uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
-`HOST`/`PORT`/`LOG_LEVEL` — опционально (по умолчанию `127.0.0.1` / `8000` / `INFO`). Без `GATEWAY_TEST_API_KEY` сервер стартует с warning и отвечает 401 на защищённые маршруты.
+Все настройки читаются из проектного `.env` автоматически, ручные `export` не нужны.
+Без обязательных `NANOGPT_INFERENCE_BASE_URL` / `NANOGPT_API_KEY` приложение завершается
+с понятной ошибкой (без вывода значений). `HOST`/`PORT`/`LOG_LEVEL` — опционально
+(по умолчанию `127.0.0.1` / `8000` / `INFO`). Без `GATEWAY_TEST_API_KEY` сервер
+стартует с warning и отвечает 401 на защищённые маршруты.
 
 ## Контракт
 
 - `GET /health` — liveness, без auth.
-- `GET /v1/models` — каталог (модель `01`), без auth.
-- `POST /v1/chat/completions` — Bearer обязателен, sync (`stream: false`) или SSE (`stream: true`).
-  - stream: чанки по словам, финальный `finish_reason: "stop"`, при `stream_options.include_usage: true` — отдельный usage-чанок, затем `data: [DONE]`.
-- Неверный/отсутствующий ключ → `401` **до** генерации. Невалидный JSON / нет `messages` → `400`. Неизвестная модель → `404 model_not_found`. Тело > 1 MiB → `413`. Пути `/api/v1` не обслуживаются.
-- Форма ответов — OpenAI Chat Completions; текст заглушки: `[local-stub] model=01 ok. Last user: ...`; usage — детерминированная фейковая оценка (`len/4`), не биллинг.
-- В логи не попадают ключ и полные `messages` (только метаданные).
+- `GET /v1/models` — публичный каталог, **авторизации не требует** (решение §2.4/§4.1).
+  Отдаётся локальный allowlist (`01`), весь каталог NanoGPT наружу не раскрывается.
+- `POST /v1/chat/completions` — `Authorization: Bearer <gateway-key>` обязателен,
+  sync (`stream: false`) или SSE (`stream: true`).
+  - Публичный `model` маппится в точный upstream ID; клиентский ключ в NanoGPT не передаётся.
+  - Неверный/отсутствующий ключ → `401` **до** любого вызова upstream.
+  - Неизвестная модель → `404 model_not_found` без вызова upstream.
+  - Невалидный JSON / нет `messages` → `400`; тело > 1 MiB → `413`.
+  - Ошибки upstream: `502` (connect/HTTP/protocol), `504` (timeout); повторов нет.
+  - Внутренняя себестоимость (`x_nanogpt_pricing`) в публичном ответе скрывается,
+    `usage` сохраняется; идентификаторы `id`, `X-Request-ID` и billing lookup ID
+    не смешиваются.
+  - Пути `/api/v1` не обслуживаются; Usage/Request Billing в этом срезе не вызываются.
+- Режим `GATEWAY_UPSTREAM=stub` в `.env` переключает на старую stub-генерацию
+  (для тестов/разработки без сети).
+
+## Логи
+
+В логи попадают только метаданные: route, статусы, модели, ID, длительность.
+`messages`, chunks, `Authorization` и содержимое `.env` не логируются.
 
 ## OpenCode
 
-`opencode.jsonc`, провайдер `local`: `baseURL: http://127.0.0.1:8000/v1`, `apiKey: {env:GATEWAY_TEST_API_KEY}`, модель `01`. Значение `GATEWAY_TEST_API_KEY` в окружении OpenCode должно совпадать с серверным.
+`opencode.jsonc`, провайдер `local`: `baseURL: http://127.0.0.1:8000/v1`,
+`apiKey` — значение клиентского ключа gateway (не ключ NanoGPT), модель `01`.
+Это значение должно совпадать с `GATEWAY_TEST_API_KEY` в проектном `.env`
+(спека §9: глобальную конфигурацию OpenCode на этом срезе не меняем).
 
 ## Тесты
 

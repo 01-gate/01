@@ -74,7 +74,7 @@
 | Метод | Путь | Auth | Назначение |
 |-------|------|------|------------|
 | GET | `/health` | нет | liveness |
-| GET | `/v1/models` | Bearer обязателен | каталог публичных моделей |
+| GET | `/v1/models` | нет — публичный (решение SPEC_004 §2.4) | каталог публичных моделей |
 | POST | `/v1/chat/completions` | Bearer обязателен | completion sync/stream |
 
 - Префикс `/api/v1` **не** обслуживается (осознанно; клиент переводится на `/v1`).
@@ -310,9 +310,9 @@ Upstream NanoGPT env (`NANOGPT_*`) **не** читать на этом этап�
 ### 9.1 Автотесты (минимальный набор, pytest + httpx ASGITransport)
 
 1. `GET /health` → 200  
-2. Без Authorization на `/v1/models` → 401  
-3. Неверный ключ → 401  
-4. Верный ключ, `/v1/models` → 200, есть `id=01`  
+2. Без Authorization на `/v1/models` → **200** (публичный; изменено по SPEC_004 §4.1)  
+3. Произвольный/неверный ключ на `/v1/models` → всё равно **200**  
+4. На `POST /v1/chat/completions` без/с неверным ключом → 401; с верным ключом → 200  
 5. `model=unknown` → 404  
 6. sync completion → 200, `choices[0].message.content` содержит `[local-stub]`, usage > 0  
 7. stream: parse SSE, есть content deltas, есть finish, есть usage (если include_usage), есть `[DONE]`  

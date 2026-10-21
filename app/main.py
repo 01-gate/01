@@ -1,4 +1,4 @@
-"""Локальный OpenAI-compatible gateway: auth, каталог, Chat Completions (stub)."""
+"""Локальный OpenAI-compatible gateway: auth, каталог, Chat Completions."""
 
 import hmac
 import json
@@ -9,26 +9,20 @@ from typing import Any
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from app.upstream.stub import run_chat
+from app import config
+from app.upstream import nanogpt, stub
 
 MAX_BODY_BYTES = 1_048_576
 
+# Публичный allowlist каталога (SPEC_004 §4.1): только контрактные поля,
+# upstream-идентификаторы в HTTP-ответ не попадают.
 PUBLIC_MODELS = {
     "01": {"id": "01", "object": "model", "created": 1729500000, "owned_by": "local"},
 }
-
-def _load_dotenv(path: str = ".env") -> None:
-    # shortcut: минимальный парсер вместо python-dotenv; только GATEWAY_* и не перезаписывает env
-    if not os.path.isfile(path):
-        return
-    with open(path, encoding="utf-8") as f:
-        for line in f:
-            key, sep, value = line.strip().partition("=")
-            if sep and key.startswith("GATEWAY_"):
-                os.environ.setdefault(key, value.strip().strip("\"'"))
-
-
-_load_dotenv()
+# Публичный id -> точный upstream ID из подтверждённого каталога NanoGPT.
+MODEL_UPSTREAM = {
+    "01": "xiaomi/mimo-v2.6-flash",
+}
 
 logger = logging.getLogger("gateway")
 if not logger.handlers:
@@ -36,7 +30,20 @@ if not logger.handlers:
     _handler.setFormatter(logging.Formatter("%(message)s"))
     logger.addHandler(_handler)
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO").upper())
+
+try:
+    config.load()
+except config.ConfigError as exc:
+    logger.critical("%s", exc)
+    raise SystemExit(2) from None
+
 app = FastAPI()
+
+
+def _upstream_mode() -> str:
+    # stub — по умолчанию тесты/локальная разработка; .env задаёт nanogpt для реального среза
+    mode = os.environ.get("GATEWAY_UPSTREAM", "stub")
+    return mode if mode in {"stub", "nanogpt"} else "stub"
 
 
 def _test_key() -> str:
@@ -67,6 +74,17 @@ def _auth_error() -> JSONResponse:
     return _error("Invalid API key", "invalid_api_key", 401)
 
 
+def _upstream_error(err: nanogpt.UpstreamError) -> JSONResponse:
+    # безопасная нормализованная ошибка без тела/заголовков upstream (§7)
+    if err.kind == "timeout":
+        return _error("Upstream timeout", "upstream_timeout", 504)
+    if err.kind == "http":
+        return _error("Upstream error", "upstream_error", 502)
+    if err.kind == "protocol":
+        return _error("Upstream protocol error", "upstream_protocol_error", 502)
+    return _error("Upstream unavailable", "upstream_unavailable", 502)
+
+
 @app.get("/health")
 async def health():
     return JSONResponse({"status": "ok"})
@@ -74,6 +92,7 @@ async def health():
 
 @app.get("/v1/models")
 async def list_models():
+    # публичный endpoint: авторизации нет по решению (§2.4, §4.1)
     return JSONResponse({"object": "list", "data": list(PUBLIC_MODELS.values())})
 
 
@@ -115,7 +134,6 @@ async def chat_completions(request: Request):
 
     model = payload.get("model")
     messages = payload.get("messages")
-    print(messages)
     stream = payload.get("stream", False)
     stream_options = payload.get("stream_options", {})
 
@@ -139,9 +157,10 @@ async def chat_completions(request: Request):
     if not isinstance(stream_options, dict):
         return bad_request("invalid_request_error", "Invalid `stream_options` field")
 
-    if model not in PUBLIC_MODELS:
+    if model not in PUBLIC_MODELS or model not in MODEL_UPSTREAM:
+        # каталог и маппинг обязаны совпадать; atomic-проверка до вызова upstream
         logger.info(
-            "chat method=POST path=/v1/chat/completions status=404 auth_present=%s auth_ok=True model=%s stream=%s",
+            "chat method=POST path=/v1/chat/completions status=404 auth_present=%s auth_ok=True model=%s stream=%s upstream_call=False",
             auth_present,
             model,
             stream,
@@ -151,36 +170,93 @@ async def chat_completions(request: Request):
     include_usage = bool(stream_options.get("include_usage", False))
     extra_fields = sorted(set(payload) - {"model", "messages", "stream", "stream_options"})
     extra = {k: payload[k] for k in extra_fields}
-    result = await run_chat(model, messages, stream, include_usage, extra)
+    base_log = (
+        "chat method=POST path=/v1/chat/completions auth_present=%s auth_ok=True model=%s "
+        "upstream_model=%s stream=%s messages_count=%s extra_fields=%s"
+    )
+    base_args = (
+        auth_present,
+        model,
+        MODEL_UPSTREAM.get(model, model) if _upstream_mode() == "nanogpt" else "-",
+        stream,
+        len(messages),
+        ",".join(extra_fields) or "-",
+    )
+
+    nano_log = (
+        base_log
+        + " status=%s response_id=%s upstream_request_id=%s billing_lookup_id=%s"
+        " upstream_status=%s usage=%s events=%s duration_ms=%s error=%s"
+    )
+
+    if _upstream_mode() == "nanogpt":
+        meta = nanogpt.UpstreamMeta()
+
+        def meta_args(status: str, error: str) -> tuple[Any, ...]:
+            return (
+                status,
+                meta.response_id or "-",
+                meta.upstream_request_id or "-",
+                meta.billing_lookup_id or "-",
+                meta.upstream_status if meta.upstream_status is not None else "-",
+                "seen" if meta.usage_seen else meta.extra.get("usage", "-"),
+                meta.events,
+                meta.duration_ms,
+                error,
+            )
+
+        try:
+            result = await nanogpt.run_chat(
+                MODEL_UPSTREAM[model], messages, stream, include_usage, extra, meta
+            )
+        except nanogpt.UpstreamError as err:
+            logger.info(
+                nano_log,
+                *base_args,
+                *meta_args("504" if err.kind == "timeout" else "502", err.kind),
+            )
+            return _upstream_error(err)
+
+        if not stream:
+            logger.info(nano_log, *base_args, *meta_args("200", "-"))
+            return JSONResponse(result)
+
+        async def sse_nano() -> Any:
+            error: str | None = None
+            try:
+                async for data in result:  # type: ignore[union-attr]
+                    yield f"data: {data}\n\n"
+                yield "data: [DONE]\n\n"
+            except nanogpt.UpstreamError as err:
+                # статус уже отправлен: обрываем поток честно, без повторов (§6, §7)
+                error = err.kind
+            finally:
+                logger.info(nano_log, *base_args, *meta_args("200", error or "-"))
+
+        return StreamingResponse(
+            sse_nano(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        )
+
+    # legacy stub-режим: прежний интерфейс и поведение (§2.11)
+    result = await stub.run_chat(model, messages, stream, include_usage, extra)
 
     if not stream:
-        logger.info(
-            "chat method=POST path=/v1/chat/completions status=200 auth_present=%s auth_ok=True model=%s stream=False messages_count=%s request_id=%s extra_fields=%s",
-            auth_present,
-            model,
-            len(messages),
-            result["id"],
-            ",".join(extra_fields) or "-",
-        )
+        logger.info(base_log + " status=200 id=%s", *base_args, result["id"])
         return JSONResponse(result)
 
     async def sse() -> Any:
         request_id = "-"
         try:
-            async for chunk in result:
-                print(chunk)
+            async for chunk in result:  # type: ignore[union-attr]
                 request_id = chunk.get("id", request_id)
                 yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
             yield "data: [DONE]\n\n"
         finally:
             # лог здесь: request_id известен и при disconnect клиента
             logger.info(
-                "chat method=POST path=/v1/chat/completions status=200 auth_present=%s auth_ok=True model=%s stream=True messages_count=%s request_id=%s extra_fields=%s",
-                auth_present,
-                model,
-                len(messages),
-                request_id,
-                ",".join(extra_fields) or "-",
+                base_log + " status=200 id=%s", *base_args, request_id
             )
 
     return StreamingResponse(
