@@ -221,6 +221,19 @@ def _clean_result(result: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+async def check_gateway_health(gateway_base: str, timeout_seconds: float) -> bool:
+    """Fail before any paid request if the configured local gateway is unreachable."""
+    root = gateway_base.rstrip("/")
+    if root.endswith("/v1"):
+        root = root[:-3]
+    try:
+        async with httpx.AsyncClient(timeout=min(timeout_seconds, 5.0)) as client:
+            response = await client.get(root + "/health")
+        return response.status_code == 200
+    except httpx.HTTPError:
+        return False
+
+
 async def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("request_json", type=Path, help="Small JSON request with messages and tools")
@@ -251,6 +264,9 @@ async def main() -> int:
 
     direct_base = os.environ.get("NANOGPT_INFERENCE_BASE_URL", DEFAULT_NANOGPT_BASE)
     gateway_base = os.environ.get("GATEWAY_BASE_URL", DEFAULT_GATEWAY_BASE)
+    if not await check_gateway_health(gateway_base, args.timeout):
+        print("Gateway health check failed; no paid request was sent.", file=sys.stderr)
+        return 2
 
     print("A/B comparison will send up to TWO paid streaming requests.")
     print("Only timing, protocol metadata, request IDs and usage counts are printed; content is suppressed.")
