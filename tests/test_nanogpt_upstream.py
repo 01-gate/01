@@ -8,19 +8,23 @@ import time
 import httpx
 import pytest
 
+from app import config, limits
 from app import main as gw
+from app.models_catalog import MODEL_CATALOG
 from app.upstream import nanogpt
 
 GATEWAY_KEY = "test-gateway-key-123"
 NANO_KEY = "sk-nano-test-upstream"
 AUTH = {"Authorization": f"Bearer {GATEWAY_KEY}"}
 NANO_BASE = "https://api.nano-gpt.com/v1"
+TEST_MODEL = config.test_model()
+TEST_UPSTREAM_MODEL = MODEL_CATALOG[TEST_MODEL]
 
 SYNC_BODY = {
     "id": "chatcmpl-up-1",
     "object": "chat.completion",
     "created": 1729500000,
-    "model": "xiaomi/mimo-v2.6-flash",
+    "model": TEST_UPSTREAM_MODEL,
     "choices": [
         {
             "index": 0,
@@ -38,7 +42,7 @@ STREAM_CHUNKS = [
             "id": "chatcmpl-up-1",
             "object": "chat.completion.chunk",
             "created": 1729500000,
-            "model": "xiaomi/mimo-v2.6-flash",
+            "model": TEST_UPSTREAM_MODEL,
             "choices": [{"index": 0, "delta": {"role": "assistant", "content": "pon"}, "finish_reason": None}],
         }
     ),
@@ -47,7 +51,7 @@ STREAM_CHUNKS = [
             "id": "chatcmpl-up-1",
             "object": "chat.completion.chunk",
             "created": 1729500000,
-            "model": "xiaomi/mimo-v2.6-flash",
+            "model": TEST_UPSTREAM_MODEL,
             "choices": [{"index": 0, "delta": {"content": "g"}, "finish_reason": "stop"}],
             "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8},
             "x_nanogpt_pricing": {"amount": 0.000001, "currency": "USD", "requestId": "req_PRICE"},
@@ -126,7 +130,7 @@ class FakeUpstream:
                             "id": "chatcmpl-up-1",
                             "object": "chat.completion.chunk",
                             "created": 1729500000,
-                            "model": "xiaomi/mimo-v2.6-flash",
+                            "model": TEST_UPSTREAM_MODEL,
                             "choices": [
                                 {
                                     "index": 0,
@@ -228,12 +232,16 @@ async def _start_server(app_obj, port):
 
 
 @pytest.fixture(autouse=True)
-def _nano_env(monkeypatch):
+def _nano_env(monkeypatch, tmp_path):
     monkeypatch.setenv("GATEWAY_UPSTREAM", "nanogpt")
     monkeypatch.setenv("GATEWAY_TEST_API_KEY", GATEWAY_KEY)
     monkeypatch.setenv("NANOGPT_API_KEY", NANO_KEY)
     monkeypatch.setenv("NANOGPT_INFERENCE_BASE_URL", NANO_BASE)
     monkeypatch.setenv("NANOGPT_USAGE_BASE_URL", "https://api.nano-gpt.com/api/v1")
+    monkeypatch.setenv("GATEWAY_REQUEST_LOG_PATH", str(tmp_path / "request_log.jsonl"))
+    limits.reset()
+    yield
+    limits.reset()
 
 
 @pytest.fixture
@@ -277,7 +285,7 @@ def test_client_base_url_from_env():
 
 def test_sync_proxied_with_separate_ids(fake, caplog):
     caplog.set_level(logging.INFO, logger="gateway")
-    r = _chat(model="01", messages=[{"role": "user", "content": "hi"}])
+    r = _chat(model=TEST_MODEL, messages=[{"role": "user", "content": "hi"}])
     assert r.status_code == 200
     assert r.headers["x-upstream-request-id"] == "req_HEADER"
     body = r.json()
@@ -298,7 +306,7 @@ def test_sync_proxied_with_separate_ids(fake, caplog):
 def test_forwarded_parameters_are_explicit_and_reasoning_effort_is_forwarded(fake):
     # NanoGPT documents reasoning_effort and reasoning controls for Chat Completions.
     r = _chat(
-        model="01",
+        model=TEST_MODEL,
         messages=[{"role": "user", "content": "hi"}],
         temperature=0.2,
         max_completion_tokens=123,
@@ -354,7 +362,7 @@ def test_tool_calling_fields_forwarded_to_upstream(fake):
         {"role": "tool", "tool_call_id": "call_1", "content": "contents"},
     ]
     r = _chat(
-        model="01",
+        model=TEST_MODEL,
         messages=messages,
         tools=tools,
         tool_choice="auto",
@@ -372,7 +380,7 @@ def test_stream_tool_call_delta_is_preserved(fake, caplog):
     caplog.set_level(logging.INFO, logger="gateway")
     fake.mode = "tool_stream"
     r = _chat(
-        model="01",
+        model=TEST_MODEL,
         messages=[{"role": "user", "content": "Read README.md"}],
         stream=True,
         tools=[
@@ -422,7 +430,7 @@ def test_tool_call_roundtrip_is_client_driven_and_not_retried(fake):
         },
     }]
     first = _chat(
-        model="01",
+        model=TEST_MODEL,
         messages=[{"role": "user", "content": "Read README.md"}],
         stream=True,
         tools=tools,
@@ -459,7 +467,7 @@ def test_tool_call_roundtrip_is_client_driven_and_not_retried(fake):
         },
         {"role": "tool", "tool_call_id": "call_1", "content": "README contents"},
     ]
-    second = _chat(model="01", messages=messages, tools=tools)
+    second = _chat(model=TEST_MODEL, messages=messages, tools=tools)
     assert second.status_code == 200
     assert len(fake.requests) == 2
     assert fake.requests[0]["payload"]["stream"] is True
@@ -468,7 +476,7 @@ def test_tool_call_roundtrip_is_client_driven_and_not_retried(fake):
 
 
 def test_usage_base_url_never_used(fake):
-    r = _chat(model="01", messages=[{"role": "user", "content": "hi"}])
+    r = _chat(model=TEST_MODEL, messages=[{"role": "user", "content": "hi"}])
     assert r.status_code == 200
     paths = [req["path"] for req in fake.requests]
     assert paths == ["/v1/chat/completions"]  # GET /usage и billing не вызываются
@@ -476,7 +484,7 @@ def test_usage_base_url_never_used(fake):
 
 
 def test_upstream_signed_with_nanogpt_key_only(fake):
-    r = _chat(model="01", messages=[{"role": "user", "content": "hi"}])
+    r = _chat(model=TEST_MODEL, messages=[{"role": "user", "content": "hi"}])
     assert r.status_code == 200
     headers = fake.requests[0]["headers"]
     assert headers["authorization"] == f"Bearer {NANO_KEY}"
@@ -492,15 +500,15 @@ def test_upstream_signed_on_stream_too(fake):
 
 
 def test_client_model_mapped_to_upstream_id(fake):
-    r = _chat(model="01", messages=[{"role": "user", "content": "hi"}])
+    r = _chat(model=TEST_MODEL, messages=[{"role": "user", "content": "hi"}])
     assert r.status_code == 200
-    assert fake.requests[0]["payload"]["model"] == "xiaomi/mimo-v2.6-flash"
+    assert fake.requests[0]["payload"]["model"] == TEST_UPSTREAM_MODEL
 
 
 def test_401_never_calls_upstream(fake):
     for headers in ({}, {"Authorization": "Bearer wrong"}):
         r = request("POST", "/v1/chat/completions", headers=headers, json={
-            "model": "01", "messages": [{"role": "user", "content": "hi"}]
+            "model": TEST_MODEL, "messages": [{"role": "user", "content": "hi"}]
         })
         assert r.status_code == 401
     assert fake.requests == []
@@ -510,6 +518,43 @@ def test_unknown_model_never_calls_upstream(fake):
     r = _chat(model="nope", messages=[{"role": "user", "content": "hi"}])
     assert r.status_code == 404
     assert fake.requests == []
+
+
+def test_only_catalog_keys_are_accepted(fake):
+    # SPEC_008 §5 шаг 1: accept-list chat атомарен каталогу; прежние лишние ключи
+    # (например luna) и upstream ID как публичный ID не принимаются
+    for bad in ("luna", TEST_UPSTREAM_MODEL, "01"):
+        r = _chat(model=bad, messages=[{"role": "user", "content": "hi"}])
+        assert r.status_code == 404, bad
+    assert fake.requests == []
+    assert TEST_MODEL in MODEL_CATALOG
+
+
+def test_concurrency_limit_rejects_before_upstream(fake, monkeypatch):
+    # SPEC_008 §5 шаг 6: превышение concurrency даёт 429 до upstream
+    monkeypatch.setenv("GATEWAY_MAX_CONCURRENT_CHAT", "1")
+    fake.stream_delay = 0.2  # первый запрос удерживает слот во время стрима
+
+    async def go():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=gw.app), base_url="http://test"
+        ) as client:
+            async def one():
+                return await client.post(
+                    "/v1/chat/completions",
+                    headers=AUTH,
+                    json={
+                        "model": TEST_MODEL,
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "stream": True,
+                    },
+                )
+
+            return await asyncio.gather(one(), one())
+
+    r1, r2 = asyncio.run(go())
+    assert sorted([r1.status_code, r2.status_code]) == [200, 429]
+    assert len(fake.requests) == 1  # на отклонённом upstream не вызывался
 
 
 # §10.3.14 streaming
@@ -527,7 +572,7 @@ def _first_stream_data(chunk_hook=None):
                 "/v1/chat/completions",
                 headers=AUTH,
                 json={
-                    "model": "01",
+                    "model": TEST_MODEL,
                     "messages": [{"role": "user", "content": "hi"}],
                     "stream": True,
                     "stream_options": {"include_usage": True},
@@ -590,7 +635,7 @@ def test_stream_not_fully_buffered_real_socket(monkeypatch):
                     "/v1/chat/completions",
                     headers=AUTH,
                     json={
-                        "model": "01",
+                        "model": TEST_MODEL,
                         "messages": [{"role": "user", "content": "hi"}],
                         "stream": True,
                     },
@@ -633,7 +678,7 @@ def test_stream_client_disconnect_no_retry(fake):
                 "POST",
                 "/v1/chat/completions",
                 headers=AUTH,
-                json={"model": "01", "messages": [{"role": "user", "content": "hi"}], "stream": True},
+                json={"model": TEST_MODEL, "messages": [{"role": "user", "content": "hi"}], "stream": True},
             ) as r:
                 async for line in r.aiter_lines():
                     if line.startswith("data: "):
@@ -641,6 +686,9 @@ def test_stream_client_disconnect_no_retry(fake):
 
     asyncio.run(_do())
     assert len(fake.requests) == 1  # повтора генерации не было
+    # NB: httpx.ASGITransport буферизует ответ, поэтому реальный disconnect
+    # клиента здесь не воспроизводится; незавершённый поток покрыт ниже
+    # тестом на реальных сокетах (test_stream_error_after_start...).
 
 
 def test_client_disconnect_closes_upstream_resources(fake, monkeypatch):
@@ -661,7 +709,7 @@ def test_client_disconnect_closes_upstream_resources(fake, monkeypatch):
 
     async def go():
         gen = await nanogpt.run_chat(
-            "xiaomi/mimo-v2.6-flash",
+            TEST_UPSTREAM_MODEL,
             [{"role": "user", "content": "hi"}],
             True,
             False,
@@ -689,8 +737,9 @@ def _patch_transport(monkeypatch, exc):
 def test_upstream_http_error_normalized(fake, capfd):
     capfd.readouterr()  # сброс буфера
     fake.mode = "http_500"
-    r = _chat(model="01", messages=[{"role": "user", "content": "hi"}])
+    r = _chat(model=TEST_MODEL, messages=[{"role": "user", "content": "hi"}])
     assert r.status_code == 502
+    assert r.headers["x-request-id"]  # ошибка тоже сопоставима с логом
     body = r.json()
     assert body["error"]["code"] == "upstream_error"
     assert "SECRET_UPSTREAM_RAW_BODY" not in r.text  # сырое тело не раскрывается
@@ -701,7 +750,7 @@ def test_upstream_http_error_normalized(fake, capfd):
 def test_connect_error_maps_to_502(monkeypatch, caplog):
     caplog.set_level(logging.INFO, logger="gateway")
     _patch_transport(monkeypatch, httpx.ConnectError("refused"))
-    r = _chat(model="01", messages=[{"role": "user", "content": "hi"}])
+    r = _chat(model=TEST_MODEL, messages=[{"role": "user", "content": "hi"}])
     assert r.status_code == 502
     assert r.json()["error"]["code"] == "upstream_unavailable"
     # SPEC_006 §5: ошибочный исход логируется с фактической длительностью
@@ -719,8 +768,9 @@ def test_timeout_maps_to_504_without_retry(monkeypatch):
         return httpx.AsyncClient(transport=BoomTransport(httpx.ReadTimeout("slow")), base_url=NANO_BASE)
 
     monkeypatch.setattr(nanogpt, "_client", factory)
-    r = _chat(model="01", messages=[{"role": "user", "content": "hi"}])
+    r = _chat(model=TEST_MODEL, messages=[{"role": "user", "content": "hi"}])
     assert r.status_code == 504
+    assert r.headers["x-request-id"]
     assert r.json()["error"]["code"] == "upstream_timeout"
     assert len(calls) == 1  # слепого повтора не было
 
@@ -728,8 +778,9 @@ def test_timeout_maps_to_504_without_retry(monkeypatch):
 def test_connect_timeout_maps_to_504_not_502(monkeypatch):
     # SPEC_005 дефект №3: ConnectTimeout — таймаут, а не ошибка соединения
     _patch_transport(monkeypatch, httpx.ConnectTimeout("slow"))
-    r = _chat(model="01", messages=[{"role": "user", "content": "hi"}])
+    r = _chat(model=TEST_MODEL, messages=[{"role": "user", "content": "hi"}])
     assert r.status_code == 504
+    assert r.headers["x-request-id"]
     assert r.json()["error"]["code"] == "upstream_timeout"
 
 
@@ -757,8 +808,9 @@ def test_classify_all_timeout_types_and_connect_error():
 def test_all_timeout_types_map_to_504(monkeypatch, exc):
     # публичный статус: любой таймаут до начала ответа — 504, без сети
     _patch_transport(monkeypatch, exc)
-    r = _chat(model="01", messages=[{"role": "user", "content": "hi"}])
+    r = _chat(model=TEST_MODEL, messages=[{"role": "user", "content": "hi"}])
     assert r.status_code == 504
+    assert r.headers["x-request-id"]
     assert r.json()["error"]["code"] == "upstream_timeout"
 
 
@@ -776,7 +828,7 @@ def _stream_chat():
         "POST",
         "/v1/chat/completions",
         headers=AUTH,
-        json={"model": "01", "messages": [{"role": "user", "content": "hi"}], "stream": True},
+        json={"model": TEST_MODEL, "messages": [{"role": "user", "content": "hi"}], "stream": True},
     )
 
 
@@ -836,7 +888,7 @@ def test_stream_connect_timeout_before_body_returns_504(monkeypatch):
 # httpx.ASGITransport буферизует ответ upstream и не воспроизводит обрыв)
 
 
-def test_stream_error_after_start_ends_without_fake_done(monkeypatch, caplog):
+def test_stream_error_after_start_ends_without_fake_done(monkeypatch, caplog, tmp_path):
     caplog.set_level(logging.INFO, logger="gateway")
     up_port = _free_port()
     gw_port = _free_port()
@@ -875,7 +927,7 @@ def test_stream_error_after_start_ends_without_fake_done(monkeypatch, caplog):
                     "/v1/chat/completions",
                     headers=AUTH,
                     json={
-                        "model": "01",
+                        "model": TEST_MODEL,
                         "messages": [{"role": "user", "content": "hi"}],
                         "stream": True,
                     },
@@ -905,13 +957,38 @@ def test_stream_error_after_start_ends_without_fake_done(monkeypatch, caplog):
     assert "error=-" not in line
     # §5: длительность обрыва не подменена нулём
     assert "duration_ms=0" not in line
+    # SPEC_008 §5 шаг 7.4: обрыв после HTTP 200 не маскируется под успех
+    rec = json.loads((tmp_path / "request_log.jsonl").read_text().strip().splitlines()[-1])
+    assert rec["status"] in {"unknown_outcome", "needs_reconciliation"}
+    assert rec["usage_seen"] is False
 
 
-def test_stream_normal_final_log_separates_states(fake, caplog):
-    # SPEC_006 §2/§3: штатный поток — успех отличим от ошибки, статусы разделены
+def test_upstream_inflight_recorded_before_awaiting_upstream(fake, monkeypatch, tmp_path):
+    # запись должна существовать до окончания генерации: иначе падение процесса
+    # во время вызова upstream оставит запрос без следа (SPEC_008 §5 шаг 7)
+    seen: list[str] = []
+    real_run_chat = nanogpt.run_chat
+
+    async def spy(*args, **kwargs):
+        seen.extend((tmp_path / "request_log.jsonl").read_text().splitlines())
+        return await real_run_chat(*args, **kwargs)
+
+    monkeypatch.setattr(nanogpt, "run_chat", spy)
+    r = _chat(model=TEST_MODEL, messages=[{"role": "user", "content": "hi"}])
+    assert r.status_code == 200
+    assert seen, "upstream_inflight отсутствовал до вызова upstream"
+    assert json.loads(seen[-1])["status"] == "upstream_inflight"
+
+
+def test_stream_normal_final_log_separates_states(fake, caplog, tmp_path):    # SPEC_006 §2/§3: штатный поток — успех отличим от ошибки, статусы разделены
     caplog.set_level(logging.INFO, logger="gateway")
     got = _first_stream_data()
     assert got[-1][1] == "[DONE]"
+    # SPEC_008 §5 шаг 7: штатный стрим пишется как succeeded с upstream id
+    rec = json.loads((tmp_path / "request_log.jsonl").read_text().strip().splitlines()[-1])
+    assert rec["status"] == "succeeded"
+    assert rec["upstream_request_id"] == "req_HEADER"
+    assert rec["usage_seen"] is True
     line = [l for l in caplog.messages if l.startswith("chat method=POST")][-1]
     assert "status=200" in line
     assert "upstream_status=200" in line
@@ -957,7 +1034,7 @@ def test_unexpected_exception_after_start_logged_as_error(monkeypatch, caplog):
 
 def test_malformed_upstream_response(fake):
     fake.mode = "malformed"
-    r = _chat(model="01", messages=[{"role": "user", "content": "hi"}])
+    r = _chat(model=TEST_MODEL, messages=[{"role": "user", "content": "hi"}])
     assert r.status_code == 502
     assert r.json()["error"]["code"] == "upstream_protocol_error"
 
@@ -965,19 +1042,20 @@ def test_malformed_upstream_response(fake):
 # §10.4 логи и секреты
 
 
-def test_no_secrets_or_prompts_in_output(fake, caplog, capfd):
+def test_no_secrets_or_prompts_in_output(fake, caplog, capfd, tmp_path):
     caplog.set_level(logging.INFO, logger="gateway")
     capfd.readouterr()
     prompt = "TOP_SECRET_PROMPT_9f3"
-    r = _chat(model="01", messages=[{"role": "user", "content": prompt}])
+    r = _chat(model=TEST_MODEL, messages=[{"role": "user", "content": prompt}])
     assert r.status_code == 200
-    r2 = request("POST", "/v1/chat/completions", json={"model": "01", "messages": []})
+    r2 = request("POST", "/v1/chat/completions", json={"model": TEST_MODEL, "messages": []})
     assert r2.status_code == 401
     fake.mode = "http_500"
-    r3 = _chat(model="01", messages=[{"role": "user", "content": prompt}])
+    r3 = _chat(model=TEST_MODEL, messages=[{"role": "user", "content": prompt}])
     assert r3.status_code == 502
     captured = capfd.readouterr()
-    haystack = caplog.text + captured.out + captured.err
+    log_text = (tmp_path / "request_log.jsonl").read_text()
+    haystack = caplog.text + captured.out + captured.err + log_text
     assert prompt not in haystack
     assert GATEWAY_KEY not in haystack
     assert NANO_KEY not in haystack
@@ -989,7 +1067,7 @@ def test_no_secrets_or_prompts_in_output(fake, caplog, capfd):
 def test_sync_missing_usage_visible_not_free(fake, caplog):
     caplog.set_level(logging.INFO, logger="gateway")
     fake.mode = "sync_no_usage"
-    r = _chat(model="01", messages=[{"role": "user", "content": "hi"}])
+    r = _chat(model=TEST_MODEL, messages=[{"role": "user", "content": "hi"}])
     assert r.status_code == 200
     assert "usage" not in r.json()
     line = [l for l in caplog.messages if "response_id=chatcmpl-up-1" in l][-1]

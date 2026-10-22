@@ -93,7 +93,9 @@ def _client() -> httpx.AsyncClient:
 
 
 def _upstream_headers() -> dict[str, str]:
-    return {"x-api-key": os.environ['NANOGPT_API_KEY']}
+    # NanoGPT документирует Authorization: Bearer <inference key>.
+    # Клиентский Authorization gateway сюда не попадает (SPEC_004 §5.1).
+    return {"Authorization": f"Bearer {os.environ['NANOGPT_API_KEY']}"}
 
 
 def _build_payload(

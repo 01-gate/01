@@ -1,5 +1,5 @@
 {
-  "model": "01",
+  "model": "deepseek",
   "messages": [
     {
       "role": "user",

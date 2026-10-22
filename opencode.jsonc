@@ -38,8 +38,23 @@
             "none": { "reasoningEffort": "none" }
           }
         },
+        "deepseek-last": {
+          "name": "03 DeepSeek Latest",
+          "description": "Лучший баланс цены и качества без но",
+          "options": {
+            "reasoningEffort": "low"
+          },
+          "limit": { "context": 250000, "output": 8192 },
+          "cost": { "input": 25, "output": 100, "cache_read": 0.5, "cache_write": 0 },
+          "variants": {
+            "max": { "reasoningEffort": "max" },
+            "high": { "reasoningEffort": "high" },
+            "low": { "reasoningEffort": "low" },
+            "none": { "reasoningEffort": "none" }
+          }
+        },
         "glm": {
-          "name": "03 GLM",
+          "name": "04 GLM",
           "description": "Лучший баланс цены и качества без но",
           "limit": {
             "context": 333333,

@@ -37,6 +37,15 @@ def _load_dotenv(path: str | Path = ".env") -> None:
                 os.environ.setdefault(key, value.strip().strip("\"'"))
 
 
+def test_model() -> str:
+    """Публичный ID модели для тестов и smoke-скриптов.
+
+    Переопределяется `GATEWAY_TEST_MODEL`, чтобы можно было проверить другую
+    модель без правки кода.
+    """
+    return os.environ.get("GATEWAY_TEST_MODEL") or "deepseek"
+
+
 def load(path: str | Path | None = None) -> None:
     """Загружает .env, валидирует обязательные настройки.
 
