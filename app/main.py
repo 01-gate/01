@@ -52,10 +52,13 @@ if not _test_key():
     logger.warning("GATEWAY_TEST_API_KEY is not set; protected requests will be rejected with 401")
 
 
-def _error(message: str, code: str, status: int) -> JSONResponse:
+def _error(message: str, code: str, status: int, request_id: str | None = None) -> JSONResponse:
+    # клиент должен уметь сопоставить любой ответ (в т.ч. ошибку) с логом
+    headers = {"X-Request-ID": request_id} if request_id else None
     return JSONResponse(
         {"error": {"message": message, "type": "invalid_request_error", "code": code}},
         status_code=status,
+        headers=headers,
     )
 
 
@@ -68,19 +71,19 @@ def _auth(request: Request) -> tuple[bool, bool]:
     return auth_present, auth_ok
 
 
-def _auth_error() -> JSONResponse:
-    return _error("Invalid API key", "invalid_api_key", 401)
+def _auth_error(request_id: str | None = None) -> JSONResponse:
+    return _error("Invalid API key", "invalid_api_key", 401, request_id)
 
 
-def _upstream_error(err: nanogpt.UpstreamError) -> JSONResponse:
+def _upstream_error(err: nanogpt.UpstreamError, request_id: str | None = None) -> JSONResponse:
     # безопасная нормализованная ошибка без тела/заголовков upstream (§7)
     if err.kind == "timeout":
-        return _error("Upstream timeout", "upstream_timeout", 504)
+        return _error("Upstream timeout", "upstream_timeout", 504, request_id)
     if err.kind == "http":
-        return _error("Upstream error", "upstream_error", 502)
+        return _error("Upstream error", "upstream_error", 502, request_id)
     if err.kind == "protocol":
-        return _error("Upstream protocol error", "upstream_protocol_error", 502)
-    return _error("Upstream unavailable", "upstream_unavailable", 502)
+        return _error("Upstream protocol error", "upstream_protocol_error", 502, request_id)
+    return _error("Upstream unavailable", "upstream_unavailable", 502, request_id)
 
 
 @app.get("/health")
@@ -120,23 +123,23 @@ async def chat_completions(request: Request):
             auth_present,
             bool(_test_key()),
         )
-        return _auth_error()
+        return _auth_error(gateway_request_id)
 
     body = bytearray()
     async for part in request.stream():
         body.extend(part)
         if len(body) > MAX_BODY_BYTES:
             log_chat("status=413 auth_present=%s auth_ok=True", auth_present)
-            return _error("Request body too large", "body_too_large", 413)
+            return _error("Request body too large", "body_too_large", 413, gateway_request_id)
 
     try:
         payload = json.loads(body)
     except ValueError:
         log_chat("status=400 auth_present=%s auth_ok=True", auth_present)
-        return _error("Invalid JSON body", "invalid_json", 400)
+        return _error("Invalid JSON body", "invalid_json", 400, gateway_request_id)
     if not isinstance(payload, dict):
         log_chat("status=400 auth_present=%s auth_ok=True", auth_present)
-        return _error("Invalid JSON body", "invalid_json", 400)
+        return _error("Invalid JSON body", "invalid_json", 400, gateway_request_id)
 
     model = payload.get("model")
     messages = payload.get("messages")
@@ -150,7 +153,7 @@ async def chat_completions(request: Request):
             model if isinstance(model, str) else "-",
             stream if isinstance(stream, bool) else "-",
         )
-        return _error(message, code, 400)
+        return _error(message, code, 400, gateway_request_id)
 
     if not isinstance(model, str) or not model:
         return bad_request("invalid_model", "Invalid `model` field")
@@ -171,7 +174,7 @@ async def chat_completions(request: Request):
             model,
             stream,
         )
-        return _error(f"The model `{model}` does not exist", "model_not_found", 404)
+        return _error(f"The model `{model}` does not exist", "model_not_found", 404, gateway_request_id)
 
     include_usage = bool(stream_options.get("include_usage", False))
     extra_fields = sorted(set(payload) - {"model", "messages", "stream", "stream_options"})
@@ -186,7 +189,7 @@ async def chat_completions(request: Request):
             model,
             stream,
         )
-        return _error("Rate limit exceeded", "rate_limit_exceeded", 429)
+        return _error("Rate limit exceeded", "rate_limit_exceeded", 429, gateway_request_id)
 
     try:
         response = await _run_chat(
@@ -300,7 +303,7 @@ async def _run_chat(
         except nanogpt.UpstreamError as err:
             log_chat(nano_log, *base_args, *meta_args("504" if err.kind == "timeout" else "502", err.kind))
             record("upstream_error", meta.usage_seen, err.kind)
-            return _upstream_error(err)
+            return _upstream_error(err, gateway_request_id)
 
         if not stream:
             log_chat(nano_log, *base_args, *meta_args("200", "-"))

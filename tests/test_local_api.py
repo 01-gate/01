@@ -113,6 +113,22 @@ def test_gateway_request_id_header_stable_and_in_logs(caplog):
     assert f"gateway_request_id={r2.headers['x-request-id']}" in caplog.text
 
 
+def test_error_responses_carry_gateway_request_id(caplog):
+    # клиент сопоставляет любой ответ (включая ошибку) с логом по X-Request-ID
+    caplog.set_level(logging.INFO, logger="gateway")
+
+    unauthorized = request(
+        "POST", "/v1/chat/completions", json={"model": TEST_MODEL, "messages": [{"role": "user"}]}
+    )
+    assert unauthorized.status_code == 401
+    rid = unauthorized.headers["x-request-id"]
+    assert f"gateway_request_id={rid}" in caplog.text
+
+    not_found = _chat(model="xyz", messages=[{"role": "user", "content": "hi"}])
+    assert not_found.status_code == 404
+    assert not_found.headers["x-request-id"]
+
+
 def test_stream_response_carries_gateway_request_id():
     r = _chat(model=TEST_MODEL, messages=[{"role": "user", "content": "hi"}], stream=True)
     assert r.status_code == 200
@@ -137,6 +153,7 @@ def test_rate_limit_returns_429_before_upstream(monkeypatch):
         limits.release()
     assert r.status_code == 429
     assert r.json()["error"]["code"] == "rate_limit_exceeded"
+    assert r.headers["x-request-id"]
 
 
 def test_sync_completion():
@@ -226,4 +243,5 @@ def test_missing_messages():
 def test_body_too_large():
     r = _chat(model=TEST_MODEL, messages=[{"role": "user", "content": "x" * (1_048_576 + 1)}])
     assert r.status_code == 413
+    assert r.headers["x-request-id"]
     assert r.json()["error"]["code"] == "body_too_large"

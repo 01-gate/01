@@ -739,6 +739,7 @@ def test_upstream_http_error_normalized(fake, capfd):
     fake.mode = "http_500"
     r = _chat(model=TEST_MODEL, messages=[{"role": "user", "content": "hi"}])
     assert r.status_code == 502
+    assert r.headers["x-request-id"]  # ошибка тоже сопоставима с логом
     body = r.json()
     assert body["error"]["code"] == "upstream_error"
     assert "SECRET_UPSTREAM_RAW_BODY" not in r.text  # сырое тело не раскрывается
@@ -769,6 +770,7 @@ def test_timeout_maps_to_504_without_retry(monkeypatch):
     monkeypatch.setattr(nanogpt, "_client", factory)
     r = _chat(model=TEST_MODEL, messages=[{"role": "user", "content": "hi"}])
     assert r.status_code == 504
+    assert r.headers["x-request-id"]
     assert r.json()["error"]["code"] == "upstream_timeout"
     assert len(calls) == 1  # слепого повтора не было
 
@@ -778,6 +780,7 @@ def test_connect_timeout_maps_to_504_not_502(monkeypatch):
     _patch_transport(monkeypatch, httpx.ConnectTimeout("slow"))
     r = _chat(model=TEST_MODEL, messages=[{"role": "user", "content": "hi"}])
     assert r.status_code == 504
+    assert r.headers["x-request-id"]
     assert r.json()["error"]["code"] == "upstream_timeout"
 
 
@@ -807,6 +810,7 @@ def test_all_timeout_types_map_to_504(monkeypatch, exc):
     _patch_transport(monkeypatch, exc)
     r = _chat(model=TEST_MODEL, messages=[{"role": "user", "content": "hi"}])
     assert r.status_code == 504
+    assert r.headers["x-request-id"]
     assert r.json()["error"]["code"] == "upstream_timeout"
 
 
