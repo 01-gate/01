@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from app import config
 from scripts.compare_direct_gateway import (
     DEFAULT_NANOGPT_BASE,
     check_gateway_health,
@@ -14,10 +15,13 @@ from scripts.compare_direct_gateway import (
     validate_tool_call_stream,
 )
 
+config.load()
+TEST_MODEL = config.test_model()
+
 
 def test_prepare_payload_forces_stream_and_bounds_default_output(tmp_path):
     source = {
-        "model": "01",
+        "model": TEST_MODEL,
         "messages": [{"role": "user", "content": "call the tool"}],
         "tools": [{"type": "function", "function": {"name": "lookup_record", "parameters": {"type": "object"}}}],
         "reasoning_effort": "low",
@@ -30,7 +34,7 @@ def test_prepare_payload_forces_stream_and_bounds_default_output(tmp_path):
     assert payload["stream"] is True
     assert payload["stream_options"]["include_usage"] is True
     assert payload["max_completion_tokens"] == 512
-    assert payload["model"] == "01"
+    assert payload["model"] == TEST_MODEL
 
 
 @pytest.mark.parametrize("field", ["max_tokens", "max_completion_tokens"])
@@ -51,8 +55,8 @@ def test_sample_request_does_not_send_unsupported_reasoning_effort():
     sample_path = Path(__file__).resolve().parents[1] / "examples" / "tool_call_ab_request.json"
     sample = json.loads(sample_path.read_text(encoding="utf-8"))
 
-    # NanoGPT rejected this field for xiaomi/mimo-v2.6-flash in a live request.
-    # Keep the diagnostic focused on tool-call SSE; model reasoning stays at its default.
+    # Диагностика сфокусирована на tool-call SSE; reasoning_effort не задаём,
+    # его поддержка зависит от модели NanoGPT.
     assert "reasoning_effort" not in sample
     assert sample["tool_choice"] == "required"
 

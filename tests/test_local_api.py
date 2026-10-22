@@ -5,17 +5,24 @@ import logging
 import httpx
 import pytest
 
+from app import config, limits
 from app.main import app
+from app.models_catalog import MODEL_CATALOG
 
 TEST_KEY = "test-gateway-key-123"
+TEST_MODEL = config.test_model()
 AUTH = {"Authorization": f"Bearer {TEST_KEY}"}
 
 
 @pytest.fixture(autouse=True)
-def _env(monkeypatch):
+def _env(monkeypatch, tmp_path):
     monkeypatch.setenv("GATEWAY_TEST_API_KEY", TEST_KEY)
     # этот файл проверяет legacy stub-режим (SPEC_004 §2.11)
     monkeypatch.setenv("GATEWAY_UPSTREAM", "stub")
+    monkeypatch.setenv("GATEWAY_REQUEST_LOG_PATH", str(tmp_path / "request_log.jsonl"))
+    limits.reset()
+    yield
+    limits.reset()
 
 
 def request(method, path, **kwargs):
@@ -64,7 +71,7 @@ def test_models_without_auth():
 def test_models_arbitrary_key_still_public():
     r = request("GET", "/v1/models", headers={"Authorization": "Bearer wrong"})
     assert r.status_code == 200
-    assert any(m["id"] == "01" for m in r.json()["data"])
+    assert any(m["id"] == TEST_MODEL for m in r.json()["data"])
 
 
 def test_models_ok():
@@ -72,7 +79,19 @@ def test_models_ok():
     assert r.status_code == 200
     data = r.json()
     assert data["object"] == "list"
-    assert any(m["id"] == "01" for m in data["data"])
+    assert any(m["id"] == TEST_MODEL for m in data["data"])
+
+
+def test_catalog_is_single_source_of_truth():
+    # SPEC_008 §5 шаг 1: GET /v1/models и accept-list chat — одно множество ID
+    r = request("GET", "/v1/models")
+    assert [m["id"] for m in r.json()["data"]] == list(MODEL_CATALOG)
+
+
+def test_old_public_model_01_rejected():
+    # публичная модель 01 не восстанавливается (SPEC_008 §2)
+    r = _chat(model="01", messages=[{"role": "user", "content": "hi"}])
+    assert r.status_code == 404
 
 
 def test_unknown_model():
@@ -82,12 +101,50 @@ def test_unknown_model():
     assert r.json()["error"]["message"] == "The model `xyz` does not exist"
 
 
+def test_gateway_request_id_header_stable_and_in_logs(caplog):
+    caplog.set_level(logging.INFO, logger="gateway")
+    r1 = _chat(model=TEST_MODEL, messages=[{"role": "user", "content": "hi"}])
+    rid = r1.headers["x-request-id"]
+    assert rid
+    assert f"gateway_request_id={rid}" in caplog.text
+    caplog.clear()
+    r2 = _chat(model=TEST_MODEL, messages=[{"role": "user", "content": "hi"}])
+    assert r2.headers["x-request-id"] != rid
+    assert f"gateway_request_id={r2.headers['x-request-id']}" in caplog.text
+
+
+def test_stream_response_carries_gateway_request_id():
+    r = _chat(model=TEST_MODEL, messages=[{"role": "user", "content": "hi"}], stream=True)
+    assert r.status_code == 200
+    assert r.headers["x-request-id"]
+
+
+def test_request_log_records_succeeded(tmp_path):
+    r = _chat(model=TEST_MODEL, messages=[{"role": "user", "content": "hi"}])
+    assert r.status_code == 200
+    rec = json.loads((tmp_path / "request_log.jsonl").read_text().strip().splitlines()[-1])
+    assert rec["status"] == "succeeded"
+    assert rec["gateway_request_id"] == r.headers["x-request-id"]
+    assert rec["model"] == TEST_MODEL
+
+
+def test_rate_limit_returns_429_before_upstream(monkeypatch):
+    monkeypatch.setenv("GATEWAY_MAX_CONCURRENT_CHAT", "1")
+    assert limits.try_acquire() is True  # занимаем единственный слот
+    try:
+        r = _chat(model=TEST_MODEL, messages=[{"role": "user", "content": "hi"}])
+    finally:
+        limits.release()
+    assert r.status_code == 429
+    assert r.json()["error"]["code"] == "rate_limit_exceeded"
+
+
 def test_sync_completion():
-    r = _chat(model="01", messages=[{"role": "user", "content": "привет"}])
+    r = _chat(model=TEST_MODEL, messages=[{"role": "user", "content": "привет"}])
     assert r.status_code == 200
     body = r.json()
     assert body["object"] == "chat.completion"
-    assert body["model"] == "01"
+    assert body["model"] == TEST_MODEL
     assert "[local-stub]" in body["choices"][0]["message"]["content"]
     assert body["choices"][0]["finish_reason"] == "stop"
     assert body["usage"]["prompt_tokens"] > 0
@@ -99,7 +156,7 @@ def test_sync_completion():
 
 def test_stream():
     r = _chat(
-        model="01",
+        model=TEST_MODEL,
         messages=[{"role": "user", "content": "hi"}],
         stream=True,
         stream_options={"include_usage": True},
@@ -129,7 +186,7 @@ def test_stream():
 
 def test_key_not_in_logs_or_responses(caplog):
     caplog.set_level(logging.INFO, logger="gateway")
-    r = _chat(model="01", messages=[{"role": "user", "content": "hi"}])
+    r = _chat(model=TEST_MODEL, messages=[{"role": "user", "content": "hi"}])
     assert r.status_code == 200
     assert TEST_KEY not in r.text
     r2 = request("GET", "/v1/models", headers=AUTH)
@@ -144,7 +201,7 @@ def test_chat_requires_auth():
     r = request(
         "POST",
         "/v1/chat/completions",
-        json={"model": "01", "messages": [{"role": "user", "content": "hi"}]},
+        json={"model": TEST_MODEL, "messages": [{"role": "user", "content": "hi"}]},
     )
     assert r.status_code == 401
 
@@ -161,12 +218,12 @@ def test_invalid_json():
 
 
 def test_missing_messages():
-    r = _chat(model="01")
+    r = _chat(model=TEST_MODEL)
     assert r.status_code == 400
     assert r.json()["error"]["code"] == "invalid_messages"
 
 
 def test_body_too_large():
-    r = _chat(model="01", messages=[{"role": "user", "content": "x" * (1_048_576 + 1)}])
+    r = _chat(model=TEST_MODEL, messages=[{"role": "user", "content": "x" * (1_048_576 + 1)}])
     assert r.status_code == 413
     assert r.json()["error"]["code"] == "body_too_large"

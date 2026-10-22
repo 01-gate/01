@@ -4,25 +4,23 @@ import hmac
 import json
 import logging
 import os
+import time
+import uuid
 from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from app import config
+from app import config, limits, request_log
+from app.models_catalog import MODEL_CATALOG
 from app.upstream import nanogpt, stub
 
 MAX_BODY_BYTES = 1_048_576
 
-# Публичный allowlist каталога (SPEC_004 §4.1): только контрактные поля,
-# upstream-идентификаторы в HTTP-ответ не попадают.
-PUBLIC_MODELS = {
-    "01": {"id": "01", "object": "model", "created": 1729500000, "owned_by": "local"},
-}
-# Публичный id -> точный upstream ID из подтверждённого каталога NanoGPT.
-MODEL_UPSTREAM = {
-    "01": "xiaomi/mimo-v2.6-flash",
-}
+# Публичный каталог строится из единого источника правды (SPEC_008 §5 шаг 1):
+# ключи MODEL_CATALOG и есть публичные ID; upstream-идентификаторы в HTTP-ответ
+# не попадают. Цены и TODO сюда не входят — это не runtime-контракт этапа.
+PUBLIC_MODELS = {index: {"id": model_id} for index, model_id in enumerate(MODEL_CATALOG, start=1)}
 
 logger = logging.getLogger("gateway")
 if not logger.handlers:
@@ -104,10 +102,21 @@ async def list_models():
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
+    gateway_request_id = str(uuid.uuid4())
+    started = time.monotonic()
+
+    def log_chat(extra: str, *args: Any) -> None:
+        # единый structured log chat path: correlation id во всех строках
+        logger.info(
+            "chat method=POST path=/v1/chat/completions gateway_request_id=%s " + extra,
+            gateway_request_id,
+            *args,
+        )
+
     auth_present, auth_ok = _auth(request)
     if not auth_ok:
-        logger.info(
-            "chat method=POST path=/v1/chat/completions status=401 auth_present=%s auth_ok=False key_set=%s",
+        log_chat(
+            "status=401 auth_present=%s auth_ok=False key_set=%s",
             auth_present,
             bool(_test_key()),
         )
@@ -117,25 +126,16 @@ async def chat_completions(request: Request):
     async for part in request.stream():
         body.extend(part)
         if len(body) > MAX_BODY_BYTES:
-            logger.info(
-                "chat method=POST path=/v1/chat/completions status=413 auth_present=%s auth_ok=True",
-                auth_present,
-            )
+            log_chat("status=413 auth_present=%s auth_ok=True", auth_present)
             return _error("Request body too large", "body_too_large", 413)
 
     try:
         payload = json.loads(body)
     except ValueError:
-        logger.info(
-            "chat method=POST path=/v1/chat/completions status=400 auth_present=%s auth_ok=True",
-            auth_present,
-        )
+        log_chat("status=400 auth_present=%s auth_ok=True", auth_present)
         return _error("Invalid JSON body", "invalid_json", 400)
     if not isinstance(payload, dict):
-        logger.info(
-            "chat method=POST path=/v1/chat/completions status=400 auth_present=%s auth_ok=True",
-            auth_present,
-        )
+        log_chat("status=400 auth_present=%s auth_ok=True", auth_present)
         return _error("Invalid JSON body", "invalid_json", 400)
 
     model = payload.get("model")
@@ -144,8 +144,8 @@ async def chat_completions(request: Request):
     stream_options = payload.get("stream_options", {})
 
     def bad_request(code: str, message: str) -> JSONResponse:
-        logger.info(
-            "chat method=POST path=/v1/chat/completions status=400 auth_present=%s auth_ok=True model=%s stream=%s",
+        log_chat(
+            "status=400 auth_present=%s auth_ok=True model=%s stream=%s",
             auth_present,
             model if isinstance(model, str) else "-",
             stream if isinstance(stream, bool) else "-",
@@ -163,10 +163,10 @@ async def chat_completions(request: Request):
     if not isinstance(stream_options, dict):
         return bad_request("invalid_request_error", "Invalid `stream_options` field")
 
-    if model not in PUBLIC_MODELS or model not in MODEL_UPSTREAM:
-        # каталог и маппинг обязаны совпадать; atomic-проверка до вызова upstream
-        logger.info(
-            "chat method=POST path=/v1/chat/completions status=404 auth_present=%s auth_ok=True model=%s stream=%s upstream_call=False",
+    if model not in MODEL_CATALOG:
+        # каталог и accept-list обязаны совпадать; atomic-проверка до вызова upstream
+        log_chat(
+            "status=404 auth_present=%s auth_ok=True model=%s stream=%s upstream_call=False",
             auth_present,
             model,
             stream,
@@ -176,14 +176,65 @@ async def chat_completions(request: Request):
     include_usage = bool(stream_options.get("include_usage", False))
     extra_fields = sorted(set(payload) - {"model", "messages", "stream", "stream_options"})
     extra = {k: payload[k] for k in extra_fields}
+    upstream_model = MODEL_CATALOG[model]
+
+    # basic лимиты проверяются ДО вызова upstream (SPEC_008 §5 шаг 6)
+    if not limits.try_acquire():
+        log_chat(
+            "status=429 auth_present=%s auth_ok=True model=%s stream=%s upstream_call=False",
+            auth_present,
+            model,
+            stream,
+        )
+        return _error("Rate limit exceeded", "rate_limit_exceeded", 429)
+
+    try:
+        response = await _run_chat(
+            log_chat,
+            request,
+            gateway_request_id,
+            started,
+            auth_present,
+            model,
+            upstream_model,
+            messages,
+            stream,
+            include_usage,
+            extra,
+            extra_fields,
+        )
+    except Exception:
+        limits.release()
+        raise
+    if isinstance(response, StreamingResponse):
+        # слот удерживается до конца стрима: генератор освобождает его сам
+        return response
+    limits.release()
+    return response
+
+
+async def _run_chat(
+    log_chat: Any,
+    request: Request,
+    gateway_request_id: str,
+    started: float,
+    auth_present: bool,
+    model: str,
+    upstream_model: str,
+    messages: list[Any],
+    stream: bool,
+    include_usage: bool,
+    extra: dict[str, Any],
+    extra_fields: list[str],
+) -> Any:
     base_log = (
-        "chat method=POST path=/v1/chat/completions auth_present=%s auth_ok=True model=%s "
+        "log_extra method=POST path=/v1/chat/completions auth_present=%s auth_ok=True model=%s "
         "upstream_model=%s stream=%s messages_count=%s extra_fields=%s"
     )
     base_args = (
         auth_present,
         model,
-        MODEL_UPSTREAM.get(model, model) if _upstream_mode() == "nanogpt" else "-",
+        upstream_model if _upstream_mode() == "nanogpt" else "-",
         stream,
         len(messages),
         ",".join(extra_fields) or "-",
@@ -230,31 +281,43 @@ async def chat_completions(request: Request):
                 error,
             )
 
+        def record(status: str, usage_seen: bool, error: str | None) -> None:
+            request_log.record(
+                gateway_request_id=gateway_request_id,
+                model=model,
+                upstream_model=upstream_model,
+                status=status,
+                usage_seen=usage_seen,
+                upstream_request_id=meta.upstream_request_id,
+                billing_lookup_id=meta.billing_lookup_id,
+                error=error,
+                started_at=started,
+                ended_at=time.monotonic(),
+            )
+
         try:
-            result = await nanogpt.run_chat(
-                MODEL_UPSTREAM[model], messages, stream, include_usage, extra, meta
-            )
+            result = await nanogpt.run_chat(upstream_model, messages, stream, include_usage, extra, meta)
         except nanogpt.UpstreamError as err:
-            logger.info(
-                nano_log,
-                *base_args,
-                *meta_args("504" if err.kind == "timeout" else "502", err.kind),
-            )
+            log_chat(nano_log, *base_args, *meta_args("504" if err.kind == "timeout" else "502", err.kind))
+            record("upstream_error", meta.usage_seen, err.kind)
             return _upstream_error(err)
 
         if not stream:
-            logger.info(nano_log, *base_args, *meta_args("200", "-"))
-            headers = {}
+            log_chat(nano_log, *base_args, *meta_args("200", "-"))
+            record("succeeded", meta.usage_seen, None)
+            headers = {"X-Request-ID": gateway_request_id}
             if meta.upstream_request_id:
                 headers["X-Upstream-Request-ID"] = meta.upstream_request_id
             return JSONResponse(result, headers=headers)
 
         async def sse_nano() -> Any:
             error: str | None = None
+            done = False
             try:
                 async for data in result:  # type: ignore[union-attr]
                     yield f"data: {data}\n\n"
                 yield "data: [DONE]\n\n"
+                done = True
             except nanogpt.UpstreamError as err:
                 # статус уже отправлен: обрываем поток честно, без повторов (§6, §7)
                 error = err.kind
@@ -263,39 +326,74 @@ async def chat_completions(request: Request):
                 # а не выдаём за штатное завершение (SPEC_006 §2)
                 error = type(exc).__name__
             finally:
-                logger.info(nano_log, *base_args, *meta_args("200", error or "-"))
+                log_chat(nano_log, *base_args, *meta_args("200", error or "-"))
+                if done:
+                    record("succeeded", meta.usage_seen, None)
+                elif error is None:
+                    # генератор закрыт до [DONE] без ошибки: disconnect клиента,
+                    # исход платной генерации неизвестен (SPEC_008 §5 шаг 7.4)
+                    record("client_disconnected", meta.usage_seen, None)
+                elif meta.upstream_request_id:
+                    # ошибка после старта, но upstream id известен — нужна сверка
+                    record("needs_reconciliation", meta.usage_seen, error)
+                else:
+                    record("unknown_outcome", meta.usage_seen, error)
+                limits.release()
 
-        response_headers = {"Cache-Control": "no-cache", "Connection": "keep-alive"}
+        response_headers = {
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Request-ID": gateway_request_id,
+        }
         if meta.upstream_request_id:
             response_headers["X-Upstream-Request-ID"] = meta.upstream_request_id
-        return StreamingResponse(
-            sse_nano(),
-            media_type="text/event-stream",
-            headers=response_headers,
-        )
+        return StreamingResponse(sse_nano(), media_type="text/event-stream", headers=response_headers)
 
     # legacy stub-режим: прежний интерфейс и поведение (§2.11)
     result = await stub.run_chat(model, messages, stream, include_usage, extra)
 
     if not stream:
-        logger.info(base_log + " status=200 id=%s", *base_args, result["id"])
-        return JSONResponse(result)
+        log_chat(base_log + " status=200 id=%s", *base_args, result["id"])
+        request_log.record(
+            gateway_request_id=gateway_request_id,
+            model=model,
+            upstream_model=None,
+            status="succeeded",
+            usage_seen=bool(result.get("usage")),
+            started_at=started,
+            ended_at=time.monotonic(),
+        )
+        return JSONResponse(result, headers={"X-Request-ID": gateway_request_id})
 
     async def sse() -> Any:
         request_id = "-"
+        done = False
         try:
             async for chunk in result:  # type: ignore[union-attr]
                 request_id = chunk.get("id", request_id)
                 yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
             yield "data: [DONE]\n\n"
+            done = True
         finally:
             # лог здесь: request_id известен и при disconnect клиента
-            logger.info(
-                base_log + " status=200 id=%s", *base_args, request_id
+            log_chat(base_log + " status=200 id=%s", *base_args, request_id)
+            request_log.record(
+                gateway_request_id=gateway_request_id,
+                model=model,
+                upstream_model=None,
+                status="succeeded" if done else "client_disconnected",
+                usage_seen=True,
+                started_at=started,
+                ended_at=time.monotonic(),
             )
+            limits.release()
 
     return StreamingResponse(
         sse(),
         media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Request-ID": gateway_request_id,
+        },
     )

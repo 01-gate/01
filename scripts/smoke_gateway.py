@@ -39,6 +39,8 @@ def main() -> int:
     if not key:
         fail("GATEWAY_TEST_API_KEY не задан; платные запросы не отправлены")
 
+    test_model = config.test_model()
+
     base_url = "http://127.0.0.1:8000"
     headers = {"Authorization": f"Bearer {key}"}
     with httpx.Client(base_url=base_url, timeout=90.0) as client:
@@ -52,8 +54,8 @@ def main() -> int:
                 fail(f"/v1/models вернул HTTP {models.status_code}; платные запросы не отправлены")
             catalog = models.json()
             ids = {item.get("id") for item in catalog.get("data", [])}
-            if "01" not in ids:
-                fail("публичная модель 01 отсутствует в каталоге; платные запросы не отправлены")
+            if test_model not in ids:
+                fail(f"публичная модель {test_model} отсутствует в каталоге; платные запросы не отправлены")
         except httpx.HTTPError:
             fail("gateway недоступен; сначала запустите uvicorn; платные запросы не отправлены")
 
@@ -65,7 +67,7 @@ def main() -> int:
                 "/v1/chat/completions",
                 headers=headers,
                 json={
-                    "model": "01",
+                    "model": test_model,
                     "messages": [{"role": "user", "content": "Reply with a short greeting."}],
                     "stream": False,
                     "max_tokens": 32,
@@ -97,7 +99,7 @@ def main() -> int:
                 "/v1/chat/completions",
                 headers=headers,
                 json={
-                    "model": "01",
+                    "model": test_model,
                     "messages": [{"role": "user", "content": "Count from one to three briefly."}],
                     "stream": True,
                     "stream_options": {"include_usage": True},

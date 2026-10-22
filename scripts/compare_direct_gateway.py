@@ -18,7 +18,13 @@ from typing import Any
 
 import httpx
 
-UPSTREAM_MODEL = "xiaomi/mimo-v2.6-flash"
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from app import config  # noqa: E402
+from app.models_catalog import MODEL_CATALOG  # noqa: E402
+
 DEFAULT_NANOGPT_BASE = "https://nano-gpt.com/api/v1"
 DEFAULT_GATEWAY_BASE = "http://127.0.0.1:8000/v1"
 MAX_BODY_BYTES = 128 * 1024
@@ -38,6 +44,14 @@ def load_project_env() -> None:
         key = key.strip()
         if key.startswith(("NANOGPT_", "GATEWAY_")):
             os.environ.setdefault(key, value.strip().strip("\"'"))
+
+
+def gateway_model() -> str:
+    return config.test_model()
+
+
+def upstream_model() -> str:
+    return MODEL_CATALOG[config.test_model()]
 
 
 def prepare_payload(path: Path) -> dict[str, Any]:
@@ -74,7 +88,7 @@ def prepare_payload(path: Path) -> dict[str, Any]:
     # Bound output cost when caller omitted an explicit limit.
     if "max_completion_tokens" not in payload and "max_tokens" not in payload:
         payload["max_completion_tokens"] = 512
-    payload["model"] = "01"
+    payload["model"] = gateway_model()
     return payload
 
 
@@ -151,7 +165,7 @@ async def run_one(
     timeout_seconds: float,
 ) -> dict[str, Any]:
     request_payload = dict(payload)
-    request_payload["model"] = UPSTREAM_MODEL if label == "direct" else "01"
+    request_payload["model"] = upstream_model() if label == "direct" else gateway_model()
     result: dict[str, Any] = {
         "route": label,
         "status": None,

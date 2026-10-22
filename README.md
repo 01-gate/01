@@ -7,11 +7,14 @@
 - `GET /health` — публичная проверка доступности; с валидным gateway key дополнительно возвращает `upstream_mode` для безопасного preflight диагностики.
 - `GET /v1/models` — публичный каталог разрешённых gateway моделей, без авторизации.
 - `POST /v1/chat/completions` — обязательный Bearer key gateway; `stream: false` и `stream: true`.
-- Публичная модель `01` сопоставлена с upstream ID `xiaomi/mimo-v2.6-flash`. Клиент передаёт `01`, а не upstream ID.
+- Публичный каталог задаёт единый источник правды `app/models_catalog.py`: `GET /v1/models` и accept-list chat используют одно и то же множество ID. Текущий каталог: `mimo`, `deepseek`, `deepseek-last`, `glm`, `spark`, `qwen`. Клиент передаёт публичный ID (например `deepseek`), а не upstream ID.
+- Каждая обработка chat получает gateway correlation ID и возвращает его в заголовке `X-Request-ID`. Upstream request ID (если есть) возвращается отдельно в `X-Upstream-Request-ID` и не подменяет gateway ID.
 - OpenAI-compatible tool calling: `tools`, `tool_choice`, `parallel_tool_calls`, сообщения с `tool_calls` и `role: "tool"`.
 - Поток передаётся без полной буферизации. При нормальном завершении gateway выдаёт один `[DONE]`; ошибка после начала ответа не превращается в успешное завершение.
 - Usage сохраняется в ответе, если upstream его возвращает. Внутреннее поле `x_nanogpt_pricing` в клиентский ответ не передаётся.
+- Простые in-process лимиты: max concurrent chat-запросов и optional окно частоты. Превышение возвращает OpenAI-compatible `429 rate_limit_exceeded` до вызова upstream.
 - Автоматических повторов генерации нет. Если соединение оборвалось после начала запроса, исход может остаться неизвестным; smoke test не запускает повтор автоматически.
+- Каждый chat-запрос получает статус (`succeeded`, `upstream_error`, `unknown_outcome`, `client_disconnected`, `needs_reconciliation`) и пишется одной строкой JSONL в `data/request_log.jsonl` (путь переопределяется `GATEWAY_REQUEST_LOG_PATH`). В файл попадают только id, модель, статус, `usage_seen` и timestamps — не секреты и не содержимое запроса.
 
 В этом срезе нет биллинга gateway, PostgreSQL, балансов, резервов, Usage API или Request Billing API.
 
@@ -34,6 +37,8 @@ cp .env.example .env
 - `GATEWAY_TEST_API_KEY` — локальный ключ, которым OpenCode авторизуется на gateway;
 - `GATEWAY_UPSTREAM=nanogpt` — включает реальный upstream;
 - `NANOGPT_INFERENCE_BASE_URL=https://api.nano-gpt.com/v1` — текущая конфигурация inference API.
+
+Необязательные значения с безопасными умолчаниями (см. `.env.example`): `GATEWAY_MAX_CONCURRENT_CHAT` (default `8`), `GATEWAY_RATE_LIMIT_REQUESTS` (default `0`, лимит выключен) и `GATEWAY_RATE_LIMIT_WINDOW_SECONDS` (default `60`), `GATEWAY_REQUEST_LOG_PATH` (default `data/request_log.jsonl`), `GATEWAY_TEST_MODEL` (default `deepseek`) — публичная модель для тестов и smoke/compare скриптов.
 
 Не добавляй кавычки вокруг значений без необходимости. Приложение само загружает проектный `.env`; вручную выполнять `export` не нужно. Путь к файлу определяется относительно расположения кода, а не текущей директории.
 
@@ -66,7 +71,7 @@ curl -fsS http://127.0.0.1:8000/health
 curl -fsS http://127.0.0.1:8000/v1/models
 ```
 
-Ожидаемые результаты: публичный health возвращает `{"status":"ok"}`; каталог содержит публичную модель с ID `01`. Эти две проверки не запускают генерацию. Если запросить health с валидным gateway key, ответ дополнительно содержит `upstream_mode` (`stub` или `nanogpt`); без авторизации режим не раскрывается.
+Ожидаемые результаты: публичный health возвращает `{"status":"ok"}`; каталог содержит публичные модели, например `deepseek`. Эти две проверки не запускают генерацию. Если каталог расширяется в `app/models_catalog.py`, обнови список моделей и в `opencode.jsonc` — иначе клиент не увидит новые ID. Если запросить health с валидным gateway key, ответ дополнительно содержит `upstream_mode` (`stub` или `nanogpt`); без авторизации режим не раскрывается.
 
 ## 4. Ограниченный реальный smoke test
 
@@ -76,7 +81,7 @@ curl -fsS http://127.0.0.1:8000/v1/models
 python scripts/smoke_gateway.py
 ```
 
-Скрипт проверяет health и публичный каталог, затем делает **не более двух платных запросов** к модели `01`: один короткий sync и один короткий SSE с `stream_options.include_usage=true`. Если sync-проверка не проходит, SSE-запрос не отправляется. Автоматических повторов нет.
+Скрипт проверяет health и публичный каталог, затем делает **не более двух платных запросов** к публичной модели `deepseek`: один короткий sync и один короткий SSE с `stream_options.include_usage=true`. Если sync-проверка не проходит, SSE-запрос не отправляется. Автоматических повторов нет.
 
 Скрипт проверяет HTTP-ответы, SSE chunks, `[DONE]` и отсутствие внутреннего `x_nanogpt_pricing` в ответе. Наличие usage выводится как наблюдение: его отсутствие само по себе не доказывает нулевую стоимость.
 
@@ -100,7 +105,7 @@ python scripts/compare_direct_gateway.py examples/tool_call_ab_request.json --co
 
 ## 6. OpenCode
 
-В корне репозитория находится `opencode.jsonc`. Он задаёт провайдер `local`, адрес `http://127.0.0.1:8000/v1`, публичную модель `01` и выбирает её как `local/01`.
+В корне репозитория находится `opencode.jsonc`. Он задаёт провайдер `zer0ne`, адрес `http://127.0.0.1:8000/v1` и модели `mimo`, `deepseek`, `deepseek-last`, `glm`, `spark`, `qwen`. Держи этот список в соответствии с `app/models_catalog.py`.
 
 Запускай OpenCode из корня репозитория, чтобы он использовал этот проектный конфиг:
 
@@ -108,7 +113,7 @@ python scripts/compare_direct_gateway.py examples/tool_call_ab_request.json --co
 opencode
 ```
 
-В списке моделей выбери `local/01`. Конфигурация OpenCode должна использовать **ключ gateway**, совпадающий с `GATEWAY_TEST_API_KEY` в проектном `.env`. NanoGPT inference key читает только сервер gateway.
+В списке моделей выбери, например, `zer0ne/deepseek`. Конфигурация OpenCode должна использовать **ключ gateway**, совпадающий с `GATEWAY_TEST_API_KEY` в проектном `.env`. NanoGPT inference key читает только сервер gateway.
 
 После обычного короткого запроса проверь агентный сценарий, в котором OpenCode вызывает инструмент, например чтение или изменение файла. Простая текстовая генерация не подтверждает tool calling: для этого gateway передаёт `tools`, `tool_choice` и `parallel_tool_calls` upstream и сохраняет tool-call chunks в SSE. Совместимость с конкретной моделью подтверждается только реальным запуском в OpenCode.
 
@@ -118,12 +123,13 @@ opencode
 |---|---|
 | Приложение завершается при старте | Есть ли в проектном `.env` `NANOGPT_INFERENCE_BASE_URL` и `NANOGPT_API_KEY`. Значения не выводятся в ошибку намеренно. |
 | `POST /v1/chat/completions` отвечает 401 | Совпадает ли ключ клиента в конфигурации OpenCode с `GATEWAY_TEST_API_KEY`. |
-| Модель отвечает 404 | Используется ли публичный ID `01`, а не upstream ID. |
+| Модель отвечает 404 | Используется ли публичный ID из `app/models_catalog.py` (например `deepseek`), а не upstream ID. |
+| Gateway отвечает 429 | Превышен `GATEWAY_MAX_CONCURRENT_CHAT` или `GATEWAY_RATE_LIMIT_REQUESTS`; подними лимит или повтори позже. |
 | Ответ похож на заглушку | Проверь, что в `.env` установлено `GATEWAY_UPSTREAM=nanogpt`, затем перезапусти сервер. |
 | Gateway возвращает 502 | Проверь доступность NanoGPT, inference base URL и наличие доступа к выбранной модели. |
 | Gateway возвращает 504 | Проверь длительность запроса и настройку `NANOGPT_TIMEOUT_SECONDS`. |
-| В OpenCode нет модели | Запусти OpenCode из корня проекта и проверь `opencode.jsonc`, provider `local` и model `01`. |
-| Текстовый запрос работает, инструменты нет | Убедись, что выбран `local/01`; проверь тесты tool calling и поведение выбранной модели в OpenCode. |
+| В OpenCode нет модели | Запусти OpenCode из корня проекта и проверь `opencode.jsonc`, provider `zer0ne` и публичные ID моделей. |
+| Текстовый запрос работает, инструменты нет | Убедись, что выбрана модель с tool calling; проверь тесты tool calling и поведение выбранной модели в OpenCode. |
 
 ## Контракт и границы
 
