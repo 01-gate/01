@@ -106,11 +106,11 @@ def test_gateway_request_id_header_stable_and_in_logs(caplog):
     r1 = _chat(model=TEST_MODEL, messages=[{"role": "user", "content": "hi"}])
     rid = r1.headers["x-request-id"]
     assert rid
-    assert f"gateway_request_id={rid}" in caplog.text
+    assert f"gateway_id={rid}" in caplog.text
     caplog.clear()
     r2 = _chat(model=TEST_MODEL, messages=[{"role": "user", "content": "hi"}])
     assert r2.headers["x-request-id"] != rid
-    assert f"gateway_request_id={r2.headers['x-request-id']}" in caplog.text
+    assert f"gateway_id={r2.headers['x-request-id']}" in caplog.text
 
 
 def test_error_responses_carry_gateway_request_id(caplog):

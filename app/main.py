@@ -86,6 +86,150 @@ def _upstream_error(err: nanogpt.UpstreamError, request_id: str | None = None) -
     return _error("Upstream unavailable", "upstream_unavailable", 502, request_id)
 
 
+def _message_stats(messages: list[Any]) -> tuple[int, int, str]:
+    """Только счётчики/роли, без текста сообщений (SPEC_009 §5.2)."""
+    counts: dict[str, int] = {}
+    chars = 0
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role")
+        role = role if isinstance(role, str) else "unknown"
+        counts[role] = counts.get(role, 0) + 1
+        content = message.get("content")
+        if isinstance(content, str):
+            chars += len(content)
+    order = ("system", "user", "assistant", "tool")
+    ordered = [r for r in order if r in counts]
+    ordered += sorted(r for r in counts if r not in order)
+    roles = ",".join(f"{r}:{counts[r]}" for r in ordered) or "-"
+    return len(messages), chars, roles
+
+
+def _fmt(value: Any) -> str:
+    return "-" if value is None else str(value)
+
+
+def _derived_metrics(
+    usage: nanogpt.TokenUsage, duration_ms: int
+) -> tuple[float | None, float | None]:
+    output_tps = None
+    if usage.output is not None and duration_ms > 0:
+        output_tps = usage.output / (duration_ms / 1000)
+    cache_hit_ratio = None
+    if usage.cache_read is not None and usage.input is not None and usage.input > 0:
+        cache_hit_ratio = usage.cache_read / usage.input
+    return output_tps, cache_hit_ratio
+
+
+def _log_chat_result(
+    *,
+    gateway_id: str,
+    model: str,
+    upstream_model: str,
+    stream: bool,
+    status: str,
+    outcome: str,
+    error: str | None,
+    meta: nanogpt.UpstreamMeta,
+    messages_count: int,
+    messages_chars: int,
+    roles: str,
+    extra_fields: list[str],
+) -> None:
+    """Две INFO-строки (summary + tokens) и полный диагностический DEBUG."""
+    usage = meta.token_usage
+    ttft_ms = meta.first_text_ms if meta.first_text_ms is not None else meta.first_event_ms
+    duration_ms = meta.duration_ms
+    logger.info(
+        "chat gateway_id=%s upstream_id=%s upstream_request_id=%s billing_lookup_id=%s"
+        " model=%s upstream_model=%s stream=%d status=%s outcome=%s duration_ms=%s"
+        " ttft_ms=%s upstream_status=%s error=%s",
+        gateway_id,
+        _fmt(meta.response_id),
+        _fmt(meta.upstream_request_id),
+        _fmt(meta.billing_lookup_id),
+        model,
+        upstream_model,
+        int(stream),
+        status,
+        outcome,
+        duration_ms,
+        _fmt(ttft_ms),
+        _fmt(meta.upstream_status),
+        error or "-",
+    )
+
+    output_tps, cache_hit_ratio = _derived_metrics(usage, duration_ms)
+    cost = usage.upstream_cost if usage.cost_seen else "unknown"
+    currency = usage.currency or "-"
+    tps = f"{output_tps:.1f}" if output_tps is not None else "-"
+    hit = f"{cache_hit_ratio:.3f}" if cache_hit_ratio is not None else "-"
+
+    if meta.usage_seen:
+        logger.info(
+            "tokens gateway_id=%s in=%s out=%s cache_r=%s cache_w=%s reason=%s"
+            " total=%s cost=%s currency=%s cost_seen=%d usage_seen=1 tps=%s"
+            " cache_hit=%s msg=%s chars=%s roles=%s",
+            gateway_id,
+            _fmt(usage.input),
+            _fmt(usage.output),
+            _fmt(usage.cache_read),
+            _fmt(usage.cache_write),
+            _fmt(usage.reasoning),
+            _fmt(usage.total),
+            cost,
+            currency,
+            int(usage.cost_seen),
+            tps,
+            hit,
+            messages_count,
+            messages_chars,
+            roles,
+        )
+    else:
+        # отсутствие usage не означает бесплатный запрос (SPEC_009 §5.3)
+        logger.info(
+            "tokens gateway_id=%s usage=missing cost=%s currency=%s cost_seen=%d"
+            " usage_seen=0 msg=%s chars=%s roles=%s",
+            gateway_id,
+            cost,
+            currency,
+            int(usage.cost_seen),
+            messages_count,
+            messages_chars,
+            roles,
+        )
+
+    logger.debug(
+        "chat_debug gateway_id=%s model=%s events=%s response_open_ms=%s"
+        " first_event_ms=%s first_text_ms=%s first_tool_call_ms=%s"
+        " tool_call_events=%s tool_call_fragments=%s first_reasoning_ms=%s"
+        " reasoning_events=%s max_event_gap_ms=%s sse_event_types=%s"
+        " delta_keys=%s finish_reasons=%s upstream_fields=%s extra_fields=%s"
+        " error_detail=%s error=%s",
+        gateway_id,
+        model,
+        meta.events,
+        _fmt(meta.response_open_ms),
+        _fmt(meta.first_event_ms),
+        _fmt(meta.first_text_ms),
+        _fmt(meta.first_tool_call_ms),
+        meta.tool_call_events,
+        meta.tool_call_fragments,
+        _fmt(meta.first_reasoning_ms),
+        meta.reasoning_events,
+        meta.max_event_gap_ms,
+        ",".join(f"{k}:{v}" for k, v in sorted(meta.sse_event_types.items())) or "-",
+        ",".join(f"{k}:{v}" for k, v in sorted(meta.delta_key_counts.items())) or "-",
+        ",".join(f"{k}:{v}" for k, v in sorted(meta.finish_reason_counts.items())) or "-",
+        meta.extra.get("upstream_fields", "-"),
+        ",".join(extra_fields) or "-",
+        meta.error_detail or "-",
+        error or "-",
+    )
+
+
 @app.get("/health")
 async def health(request: Request):
     # Keep the public health contract minimal. A valid gateway key additionally
@@ -193,7 +337,6 @@ async def chat_completions(request: Request):
 
     try:
         response = await _run_chat(
-            log_chat,
             request,
             gateway_request_id,
             started,
@@ -217,7 +360,6 @@ async def chat_completions(request: Request):
 
 
 async def _run_chat(
-    log_chat: Any,
     request: Request,
     gateway_request_id: str,
     started: float,
@@ -230,87 +372,77 @@ async def _run_chat(
     extra: dict[str, Any],
     extra_fields: list[str],
 ) -> Any:
-    base_log = (
-        "log_extra method=POST path=/v1/chat/completions auth_present=%s auth_ok=True model=%s "
-        "upstream_model=%s stream=%s messages_count=%s extra_fields=%s"
-    )
-    base_args = (
-        auth_present,
-        model,
-        upstream_model if _upstream_mode() == "nanogpt" else "-",
-        stream,
-        len(messages),
-        ",".join(extra_fields) or "-",
-    )
+    messages_count, messages_chars, roles = _message_stats(messages)
+    is_nanogpt = _upstream_mode() == "nanogpt"
+    public_upstream_model = upstream_model if is_nanogpt else "-"
 
-    nano_log = (
-        base_log
-        + " status=%s response_id=%s upstream_request_id=%s billing_lookup_id=%s"
-        " upstream_status=%s usage=%s events=%s duration_ms=%s"
-        " response_open_ms=%s first_event_ms=%s first_text_ms=%s"
-        " first_tool_call_ms=%s tool_call_events=%s tool_call_fragments=%s"
-        " first_reasoning_ms=%s reasoning_events=%s max_event_gap_ms=%s"
-        " sse_event_types=%s delta_keys=%s finish_reasons=%s upstream_fields=%s"
-        " error_detail=%s error=%s"
-    )
-
-    if _upstream_mode() == "nanogpt":
+    if is_nanogpt:
         meta = nanogpt.UpstreamMeta()
 
-        def meta_args(status: str, error: str) -> tuple[Any, ...]:
-            return (
-                status,
-                meta.response_id or "-",
-                meta.upstream_request_id or "-",
-                meta.billing_lookup_id or "-",
-                meta.upstream_status if meta.upstream_status is not None else "-",
-                "seen" if meta.usage_seen else meta.extra.get("usage", "-"),
-                meta.events,
-                meta.duration_ms,
-                meta.response_open_ms if meta.response_open_ms is not None else "-",
-                meta.first_event_ms if meta.first_event_ms is not None else "-",
-                meta.first_text_ms if meta.first_text_ms is not None else "-",
-                meta.first_tool_call_ms if meta.first_tool_call_ms is not None else "-",
-                meta.tool_call_events,
-                meta.tool_call_fragments,
-                meta.first_reasoning_ms if meta.first_reasoning_ms is not None else "-",
-                meta.reasoning_events,
-                meta.max_event_gap_ms,
-                ",".join(f"{k}:{v}" for k, v in sorted(meta.sse_event_types.items())) or "-",
-                ",".join(f"{k}:{v}" for k, v in sorted(meta.delta_key_counts.items())) or "-",
-                ",".join(f"{k}:{v}" for k, v in sorted(meta.finish_reason_counts.items())) or "-",
-                meta.extra.get("upstream_fields", "-"),
-                meta.error_detail or "-",
-                error,
+        def log_result(status: str, outcome: str, error: str | None) -> None:
+            _log_chat_result(
+                gateway_id=gateway_request_id,
+                model=model,
+                upstream_model=public_upstream_model,
+                stream=stream,
+                status=status,
+                outcome=outcome,
+                error=error,
+                meta=meta,
+                messages_count=messages_count,
+                messages_chars=messages_chars,
+                roles=roles,
+                extra_fields=extra_fields,
             )
 
-        def record(status: str, usage_seen: bool, error: str | None) -> None:
+        def record(status: str, error: str | None) -> None:
+            usage = meta.token_usage
+            output_tps, cache_hit_ratio = _derived_metrics(usage, meta.duration_ms)
             request_log.record(
                 gateway_request_id=gateway_request_id,
                 model=model,
                 upstream_model=upstream_model,
                 status=status,
-                usage_seen=usage_seen,
+                usage_seen=meta.usage_seen,
                 upstream_request_id=meta.upstream_request_id,
                 billing_lookup_id=meta.billing_lookup_id,
                 error=error,
                 started_at=started,
                 ended_at=time.monotonic(),
+                input_tokens=usage.input,
+                output_tokens=usage.output,
+                cache_read=usage.cache_read,
+                cache_write=usage.cache_write,
+                reasoning=usage.reasoning,
+                total_tokens=usage.total,
+                upstream_cost=usage.upstream_cost,
+                currency=usage.currency,
+                cost_seen=usage.cost_seen,
+                ttft_ms=(
+                    meta.first_text_ms
+                    if meta.first_text_ms is not None
+                    else meta.first_event_ms
+                ),
+                output_tps=output_tps,
+                messages_count=messages_count,
+                messages_chars=messages_chars,
+                roles=roles,
+                cache_hit_ratio=cache_hit_ratio,
             )
 
         try:
             # заявка на сверку живёт ДО ожидания upstream: если процесс упадёт
             # во время генерации, запись с gateway_request_id уже на диске
-            record("upstream_inflight", meta.usage_seen, None)
+            record("upstream_inflight", None)
             result = await nanogpt.run_chat(upstream_model, messages, stream, include_usage, extra, meta)
         except nanogpt.UpstreamError as err:
-            log_chat(nano_log, *base_args, *meta_args("504" if err.kind == "timeout" else "502", err.kind))
-            record("upstream_error", meta.usage_seen, err.kind)
+            log_result("504" if err.kind == "timeout" else "502", "upstream_error", err.kind)
+            record("upstream_error", err.kind)
             return _upstream_error(err, gateway_request_id)
 
         if not stream:
-            log_chat(nano_log, *base_args, *meta_args("200", "-"))
-            record("succeeded", meta.usage_seen, None)
+            log_result("200", "succeeded", None)
+            record("succeeded", None)
             headers = {"X-Request-ID": gateway_request_id}
             if meta.upstream_request_id:
                 headers["X-Upstream-Request-ID"] = meta.upstream_request_id
@@ -318,7 +450,7 @@ async def _run_chat(
 
         # upstream уже ответил: id известны, фиксируем их в заявке на сверку
         # до того, как стрим начнёт отдавать данные клиенту
-        record("upstream_inflight", meta.usage_seen, None)
+        record("upstream_inflight", None)
 
         async def sse_nano() -> Any:
             error: str | None = None
@@ -336,18 +468,23 @@ async def _run_chat(
                 # а не выдаём за штатное завершение (SPEC_006 §2)
                 error = type(exc).__name__
             finally:
-                log_chat(nano_log, *base_args, *meta_args("200", error or "-"))
                 if done:
-                    record("succeeded", meta.usage_seen, None)
+                    outcome = "succeeded"
+                    record_status = "succeeded"
                 elif error is None:
                     # генератор закрыт до [DONE] без ошибки: disconnect клиента,
                     # исход платной генерации неизвестен (SPEC_008 §5 шаг 7.4)
-                    record("client_disconnected", meta.usage_seen, None)
+                    outcome = "client_disconnected"
+                    record_status = "client_disconnected"
                 elif meta.upstream_request_id:
                     # ошибка после старта, но upstream id известен — нужна сверка
-                    record("needs_reconciliation", meta.usage_seen, error)
+                    outcome = "needs_reconciliation"
+                    record_status = "needs_reconciliation"
                 else:
-                    record("unknown_outcome", meta.usage_seen, error)
+                    outcome = "unknown_outcome"
+                    record_status = "unknown_outcome"
+                log_result("200", outcome, error)
+                record(record_status, error)
                 limits.release()
 
         response_headers = {
@@ -360,42 +497,93 @@ async def _run_chat(
         return StreamingResponse(sse_nano(), media_type="text/event-stream", headers=response_headers)
 
     # legacy stub-режим: прежний интерфейс и поведение (§2.11)
+    meta = nanogpt.UpstreamMeta()
     result = await stub.run_chat(model, messages, stream, include_usage, extra)
 
-    if not stream:
-        log_chat(base_log + " status=200 id=%s", *base_args, result["id"])
+    def log_stub(status: str, outcome: str, error: str | None) -> None:
+        _log_chat_result(
+            gateway_id=gateway_request_id,
+            model=model,
+            upstream_model=public_upstream_model,
+            stream=stream,
+            status=status,
+            outcome=outcome,
+            error=error,
+            meta=meta,
+            messages_count=messages_count,
+            messages_chars=messages_chars,
+            roles=roles,
+            extra_fields=extra_fields,
+        )
+
+    def record_stub(status: str) -> None:
+        usage = meta.token_usage
+        output_tps, cache_hit_ratio = _derived_metrics(usage, meta.duration_ms)
         request_log.record(
             gateway_request_id=gateway_request_id,
             model=model,
             upstream_model=None,
-            status="succeeded",
-            usage_seen=bool(result.get("usage")),
+            status=status,
+            usage_seen=meta.usage_seen,
             started_at=started,
             ended_at=time.monotonic(),
+            input_tokens=usage.input,
+            output_tokens=usage.output,
+            cache_read=usage.cache_read,
+            cache_write=usage.cache_write,
+            reasoning=usage.reasoning,
+            total_tokens=usage.total,
+            upstream_cost=usage.upstream_cost,
+            currency=usage.currency,
+            cost_seen=usage.cost_seen,
+            ttft_ms=(
+                meta.first_text_ms if meta.first_text_ms is not None else meta.first_event_ms
+            ),
+            output_tps=output_tps,
+            messages_count=messages_count,
+            messages_chars=messages_chars,
+            roles=roles,
+            cache_hit_ratio=cache_hit_ratio,
         )
+
+    if not stream:
+        meta.response_id = result.get("id") if isinstance(result, dict) else None
+        meta.duration_ms = int((time.monotonic() - started) * 1000)
+        meta.token_usage = nanogpt.extract_token_usage(result)
+        meta.usage_seen = meta.token_usage.usage_seen
+        log_stub("200", "succeeded", None)
+        record_stub("succeeded")
         return JSONResponse(result, headers={"X-Request-ID": gateway_request_id})
 
     async def sse() -> Any:
-        request_id = "-"
         done = False
         try:
             async for chunk in result:  # type: ignore[union-attr]
-                request_id = chunk.get("id", request_id)
+                elapsed_ms = int((time.monotonic() - started) * 1000)
+                if meta.first_event_ms is None:
+                    meta.first_event_ms = elapsed_ms
+                if isinstance(chunk, dict):
+                    if isinstance(chunk.get("id"), str):
+                        meta.response_id = chunk["id"]
+                    content = ""
+                    for choice in chunk.get("choices", []):
+                        if isinstance(choice, dict):
+                            delta = choice.get("delta", {})
+                            if isinstance(delta, dict) and isinstance(delta.get("content"), str):
+                                content += delta["content"]
+                    if content and meta.first_text_ms is None:
+                        meta.first_text_ms = elapsed_ms
+                    _meta_usage = nanogpt.extract_token_usage(chunk)
+                    nanogpt.merge_token_usage(meta.token_usage, _meta_usage)
+                    meta.usage_seen = meta.usage_seen or _meta_usage.usage_seen
                 yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
             yield "data: [DONE]\n\n"
             done = True
         finally:
+            meta.duration_ms = int((time.monotonic() - started) * 1000)
             # лог здесь: request_id известен и при disconnect клиента
-            log_chat(base_log + " status=200 id=%s", *base_args, request_id)
-            request_log.record(
-                gateway_request_id=gateway_request_id,
-                model=model,
-                upstream_model=None,
-                status="succeeded" if done else "client_disconnected",
-                usage_seen=True,
-                started_at=started,
-                ended_at=time.monotonic(),
-            )
+            log_stub("200", "succeeded" if done else "client_disconnected", None)
+            record_stub("succeeded" if done else "client_disconnected")
             limits.release()
 
     return StreamingResponse(
