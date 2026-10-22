@@ -14,7 +14,8 @@
 - Usage сохраняется в ответе, если upstream его возвращает. Внутреннее поле `x_nanogpt_pricing` в клиентский ответ не передаётся.
 - Простые in-process лимиты: max concurrent chat-запросов и optional окно частоты. Превышение возвращает OpenAI-compatible `429 rate_limit_exceeded` до вызова upstream.
 - Автоматических повторов генерации нет. Если соединение оборвалось после начала запроса, исход может остаться неизвестным; smoke test не запускает повтор автоматически.
-- Каждый chat-запрос получает статус (`upstream_inflight` — до ожидания upstream, далее `succeeded`, `upstream_error`, `unknown_outcome`, `client_disconnected`, `needs_reconciliation`) и пишется строками JSONL в `data/request_log.jsonl` (путь переопределяется `GATEWAY_REQUEST_LOG_PATH`). Строка `upstream_inflight` пишется до вызова NanoGPT, поэтому авария процесса во время генерации не оставляет запрос без следа. В файл попадают только id, модель, статус, `usage_seen` и timestamps — не секреты и не содержимое запроса.
+- Каждый chat-запрос получает статус (`upstream_inflight` — до ожидания upstream, далее `succeeded`, `upstream_error`, `unknown_outcome`, `client_disconnected`, `needs_reconciliation`) и пишется строками JSONL в `data/request_log.jsonl` (путь переопределяется `GATEWAY_REQUEST_LOG_PATH`). Строка `upstream_inflight` пишется до вызова NanoGPT, поэтому авария процесса во время генерации не оставляет запрос без следа. В файл попадают только id, модель, статус, нормализованные токены/cost, длительность и счётчики сообщений — не секреты, не промпты и не содержимое запроса.
+- В `LOG_LEVEL=INFO` каждый завершённый chat пишет две строки: `chat ...` (model, ids, status, outcome, duration, ttft) и `tokens ...` (in/out/cache/reasoning/total, cost, tps, cache_hit, msg stats). SSE-диагностика (`delta_keys`, `events`, `finish_reasons`, gap/tool timings) доступна только при `LOG_LEVEL=DEBUG`.
 
 В этом срезе нет биллинга gateway, PostgreSQL, балансов, резервов, Usage API или Request Billing API.
 
@@ -72,6 +73,43 @@ curl -fsS http://127.0.0.1:8000/v1/models
 ```
 
 Ожидаемые результаты: публичный health возвращает `{"status":"ok"}`; каталог содержит публичные модели, например `deepseek`. Эти две проверки не запускают генерацию. Если каталог расширяется в `app/models_catalog.py`, обнови список моделей и в `opencode.jsonc` — иначе клиент не увидит новые ID. Если запросить health с валидным gateway key, ответ дополнительно содержит `upstream_mode` (`stub` или `nanogpt`); без авторизации режим не раскрывается.
+
+### Боевой запуск без Docker
+
+Личный серверный запуск — вручную, без systemd/nginx в репозитории:
+
+```bash
+cd /path/to/01
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+cp .env.example .env
+# заполнить NANOGPT_API_KEY и GATEWAY_TEST_API_KEY
+```
+
+В `.env` для боя:
+
+- `GATEWAY_UPSTREAM=nanogpt` — обязательное значение; иначе останется `stub`;
+- `LOG_LEVEL=INFO` — боевой уровень логов;
+- `GATEWAY_REQUEST_LOG_PATH=/абсолютный/путь/request_log.jsonl` — лучше вне каталога деплоя;
+- `GATEWAY_MAX_CONCURRENT_CHAT=8` или меньше на маленьком VPS;
+- `NANOGPT_TIMEOUT_SECONDS=90` или больше.
+
+Запуск (за reverse proxy владельца или с `0.0.0.0`, если порт закрыт firewall):
+
+```bash
+uvicorn app.main:app --host 127.0.0.1 --port 8000
+```
+
+Проверка:
+
+```bash
+curl -fsS http://127.0.0.1:8000/health
+curl -fsS -H "Authorization: Bearer $GATEWAY_TEST_API_KEY" http://127.0.0.1:8000/health
+# второй ответ должен содержать "upstream_mode":"nanogpt"
+```
+
+В journal/stdout на каждый chat смотри две строки с одинаковым `gateway_id`: `chat ...` и `tokens ...`. Если usage не пришёл, вторая строка содержит `usage=missing`, а при неизвестном cost — `cost=unknown`; это не означает бесплатный запрос.
 
 ## 4. Ограниченный реальный smoke test
 

@@ -99,8 +99,9 @@ class FakeUpstream:
             )
             await send({"type": "http.response.body", "body": b"not-json-at-all"})
             return
-        if self.mode == "sync_no_usage":
-            body = {k: v for k, v in SYNC_BODY.items() if k != "usage"}
+        if self.mode in {"sync_no_usage", "sync_nothing"}:
+            drop = {"usage"} if self.mode == "sync_no_usage" else {"usage", "x_nanogpt_pricing"}
+            body = {k: v for k, v in SYNC_BODY.items() if k not in drop}
             await send(
                 {
                     "type": "http.response.start",
@@ -296,8 +297,8 @@ def test_sync_proxied_with_separate_ids(fake, caplog):
     # §5.4: внутренняя себестоимость скрыта
     assert "x_nanogpt_pricing" not in body
     # §5.3/10.3.13: все идентификаторы в логе раздельно и непусты
-    line = [l for l in caplog.messages if "response_id=" in l][-1]
-    assert "response_id=chatcmpl-up-1" in line
+    line = [l for l in caplog.messages if l.startswith("chat ")][-1]
+    assert "upstream_id=chatcmpl-up-1" in line
     assert "upstream_request_id=req_HEADER" in line
     assert "billing_lookup_id=req_PRICE" in line
     assert fake.requests[0]["path"] == "/v1/chat/completions"
@@ -377,7 +378,7 @@ def test_tool_calling_fields_forwarded_to_upstream(fake):
 
 
 def test_stream_tool_call_delta_is_preserved(fake, caplog):
-    caplog.set_level(logging.INFO, logger="gateway")
+    caplog.set_level(logging.DEBUG, logger="gateway")
     fake.mode = "tool_stream"
     r = _chat(
         model=TEST_MODEL,
@@ -406,12 +407,14 @@ def test_stream_tool_call_delta_is_preserved(fake, caplog):
     assert tool_chunks
     assert tool_chunks[0]["function"]["name"] == "read_file"
     assert events[-1] == "[DONE]"
-    line = [l for l in caplog.messages if l.startswith("chat method=POST")][-1]
-    assert "tool_call_events=1" in line
-    assert "tool_call_fragments=1" in line
-    assert "first_tool_call_ms=" in line
-    assert "finish_reasons=tool_calls:1" in line
-    assert "TOP_SECRET" not in line
+    info_lines = [l for l in caplog.messages if l.startswith(("chat ", "tokens "))]
+    debug_line = [l for l in caplog.messages if l.startswith("chat_debug ")][-1]
+    assert all("delta_keys" not in l and "tool_call_events" not in l for l in info_lines)
+    assert "tool_call_events=1" in debug_line
+    assert "tool_call_fragments=1" in debug_line
+    assert "first_tool_call_ms=" in debug_line
+    assert "finish_reasons=tool_calls:1" in debug_line
+    assert "TOP_SECRET" not in debug_line
 
 
 def test_tool_call_roundtrip_is_client_driven_and_not_retried(fake):
@@ -665,8 +668,11 @@ def test_stream_usage_missing_is_visible(fake, caplog):
     fake.mode = "stream_no_usage"
     got = _first_stream_data()
     assert got[-1][1] == "[DONE]"
-    line = [l for l in caplog.messages if l.startswith("chat method=POST")][-1]
+    line = [l for l in caplog.messages if l.startswith("tokens ")][-1]
     assert "usage=missing" in line  # не «бесплатно», а наблюдение для сверки
+    # pricing в чанке известен, поэтому cost не unknown; usage всё ещё missing
+    assert "cost=0.000001" in line
+    assert "cost_seen=1" in line
 
 
 def test_stream_client_disconnect_no_retry(fake):
@@ -756,8 +762,10 @@ def test_connect_error_maps_to_502(monkeypatch, caplog):
     # SPEC_006 §5: ошибочный исход логируется с фактической длительностью
     # (мгновенный отказ честно даёт duration_ms=0 — быть ненулевой он обязан
     # только при реальной задержке, что проверяет тест 613)
-    line = [l for l in caplog.messages if l.startswith("chat method=POST")][-1]
+    line = [l for l in caplog.messages if l.startswith("chat ")][-1]
     assert "error=connect" in line
+    assert "outcome=upstream_error" in line
+    assert any(l.startswith("tokens ") and "usage=missing" in l for l in caplog.messages)
 
 
 def test_timeout_maps_to_504_without_retry(monkeypatch):
@@ -864,7 +872,7 @@ def test_stream_connect_error_before_body_returns_502(monkeypatch, caplog):
     r = _stream_chat()
     assert r.status_code == 502
     assert r.json()["error"]["code"] == "upstream_unavailable"
-    line = [l for l in caplog.messages if l.startswith("chat method=POST")][-1]
+    line = [l for l in caplog.messages if l.startswith("chat ")][-1]
     assert "duration_ms=0" not in line  # SPEC_006 §5: диагностика не подменена нулём
 
 
@@ -949,7 +957,7 @@ def test_stream_error_after_start_ends_without_fake_done(monkeypatch, caplog, tm
     assert status == 200  # статус уже отправлен, поменять нельзя
     assert got and got[0].startswith('{"id": "chatcmpl-up-1"')  # событие дошло
     assert "[DONE]" not in got  # поток обрывается честно, без подделки
-    line = [l for l in caplog.messages if l.startswith("chat method=POST")][-1]
+    line = [l for l in caplog.messages if l.startswith("chat ")][-1]
     assert not line.rstrip().endswith("error=-")  # состояние зафиксировано в логе
     # SPEC_006 §1/§3: HTTP-статус первоначальный, результат потока отделён как ошибка
     assert "status=200" in line
@@ -981,7 +989,7 @@ def test_upstream_inflight_recorded_before_awaiting_upstream(fake, monkeypatch, 
 
 
 def test_stream_normal_final_log_separates_states(fake, caplog, tmp_path):    # SPEC_006 §2/§3: штатный поток — успех отличим от ошибки, статусы разделены
-    caplog.set_level(logging.INFO, logger="gateway")
+    caplog.set_level(logging.DEBUG, logger="gateway")
     got = _first_stream_data()
     assert got[-1][1] == "[DONE]"
     # SPEC_008 §5 шаг 7: штатный стрим пишется как succeeded с upstream id
@@ -989,26 +997,34 @@ def test_stream_normal_final_log_separates_states(fake, caplog, tmp_path):    # 
     assert rec["status"] == "succeeded"
     assert rec["upstream_request_id"] == "req_HEADER"
     assert rec["usage_seen"] is True
-    line = [l for l in caplog.messages if l.startswith("chat method=POST")][-1]
+    info_lines = [l for l in caplog.messages if l.startswith(("chat ", "tokens "))]
+    line = [l for l in caplog.messages if l.startswith("chat ")][-1]
+    assert len(info_lines) == 2  # ровно summary + tokens
     assert "status=200" in line
     assert "upstream_status=200" in line
-    assert "events=2" in line
+    assert "outcome=succeeded" in line
     assert line.rstrip().endswith("error=-")
+    assert "tokens gateway_id=" in info_lines[1]
+    assert "in=5 out=3" in info_lines[1]
+    assert "cache_r=-" in info_lines[1]
+    assert all("delta_keys" not in l and "events=" not in l for l in info_lines)
     # Диагностика разделяет время открытия upstream и задержку первого события/текста.
-    assert "response_open_ms=" in line
-    assert "first_event_ms=" in line
-    assert "first_text_ms=" in line
-    assert "max_event_gap_ms=" in line
-    assert "first_tool_call_ms=" in line
-    assert "tool_call_events=0" in line
-    assert "tool_call_fragments=0" in line
-    assert "first_reasoning_ms=" in line
-    assert "reasoning_events=0" in line
-    assert "sse_event_types=message:2" in line
-    assert "delta_keys=content:2,role:1" in line
-    assert "finish_reasons=stop:1" in line
-    assert "upstream_fields=" in line
-    assert "error_detail=-" in line
+    debug_line = [l for l in caplog.messages if l.startswith("chat_debug ")][-1]
+    assert "events=2" in debug_line
+    assert "response_open_ms=" in debug_line
+    assert "first_event_ms=" in debug_line
+    assert "first_text_ms=" in debug_line
+    assert "max_event_gap_ms=" in debug_line
+    assert "first_tool_call_ms=" in debug_line
+    assert "tool_call_events=0" in debug_line
+    assert "tool_call_fragments=0" in debug_line
+    assert "first_reasoning_ms=" in debug_line
+    assert "reasoning_events=0" in debug_line
+    assert "sse_event_types=message:2" in debug_line
+    assert "delta_keys=content:2,role:1" in debug_line
+    assert "finish_reasons=stop:1" in debug_line
+    assert "upstream_fields=" in debug_line
+    assert "error_detail=-" in debug_line
 
 
 def test_unexpected_exception_after_start_logged_as_error(monkeypatch, caplog):
@@ -1026,7 +1042,7 @@ def test_unexpected_exception_after_start_logged_as_error(monkeypatch, caplog):
     monkeypatch.setattr(nanogpt, "run_chat", run_chat)
     r = _stream_chat()
     assert r.status_code == 200  # заголовки уже отправлены, менять нельзя
-    line = [l for l in caplog.messages if l.startswith("chat method=POST")][-1]
+    line = [l for l in caplog.messages if l.startswith("chat ")][-1]
     assert "error=ValueError" in line
     assert "error=-" not in line
     assert "[DONE]" not in r.text  # завершение не подделано
@@ -1070,8 +1086,9 @@ def test_sync_missing_usage_visible_not_free(fake, caplog):
     r = _chat(model=TEST_MODEL, messages=[{"role": "user", "content": "hi"}])
     assert r.status_code == 200
     assert "usage" not in r.json()
-    line = [l for l in caplog.messages if "response_id=chatcmpl-up-1" in l][-1]
+    line = [l for l in caplog.messages if l.startswith("tokens ")][-1]
     assert "usage=missing" in line  # наблюдение, а не «бесплатный запрос»
+    assert "cost=0.000001" in line  # cost из pricing известен даже без usage
 
 
 def test_usage_base_url_not_used_by_runtime():
@@ -1082,3 +1099,181 @@ def test_usage_base_url_not_used_by_runtime():
     sources = [root / "main.py", root / "upstream" / "nanogpt.py", root / "upstream" / "stub.py"]
     for src in sources:
         assert "NANOGPT_USAGE_BASE_URL" not in src.read_text(encoding="utf-8"), src
+
+
+# SPEC_009 §5: нормализация usage/pricing, две INFO-строки, JSONL enrichment
+
+
+def test_extract_token_usage_usage_priority_and_details():
+    body = {
+        "usage": {
+            "prompt_tokens": 1200,
+            "completion_tokens": 340,
+            "total_tokens": 1540,
+            "reasoning_tokens": 40,
+            "cached_tokens": 50,
+            "cache_write_tokens": 7,
+            "cost": 0.0012,
+            "currency": "USD",
+        },
+        "x_nanogpt_pricing": {
+            "amount": 9.99,
+            "currency": "EUR",
+            "inputTokens": 1,
+            "outputTokens": 1,
+            "cacheReadInputTokens": 1,
+            "requestId": "req_1",
+        },
+    }
+    usage = nanogpt.extract_token_usage(body)
+    assert (usage.input, usage.output, usage.total) == (1200, 340, 1540)
+    assert usage.cache_read == 50
+    assert usage.cache_write == 7
+    assert usage.reasoning == 40
+    # приоритет: usage.cost выше pricing.amount
+    assert usage.upstream_cost == "0.0012"
+    assert usage.currency == "USD"
+    assert usage.cost_seen is True
+    assert usage.usage_seen is True
+
+
+def test_extract_token_usage_pricing_only_and_usd_fallback():
+    pricing_only = {
+        "x_nanogpt_pricing": {
+            "inputTokens": 10,
+            "outputTokens": 4,
+            "cacheReadInputTokens": 2,
+            "amount": 0.02,
+            "currency": "EUR",
+        }
+    }
+    usage = nanogpt.extract_token_usage(pricing_only)
+    assert (usage.input, usage.output, usage.total) == (10, 4, 14)
+    assert usage.cache_read == 2
+    assert usage.upstream_cost == "0.02"
+    assert usage.currency == "EUR"
+    assert usage.usage_seen is False
+
+    usd = nanogpt.extract_token_usage({"x_nanogpt_pricing": {"costUsd": 0.03}})
+    assert usd.upstream_cost == "0.03"
+    assert usd.currency == "USD"
+
+
+def test_extract_token_usage_empty_is_missing_not_zero():
+    usage = nanogpt.extract_token_usage({})
+    assert usage.usage_seen is False
+    assert usage.cost_seen is False
+    assert usage.upstream_cost is None
+    assert all(
+        getattr(usage, name) is None
+        for name in ("input", "output", "cache_read", "cache_write", "reasoning", "total")
+    )
+
+
+def test_extract_token_usage_does_not_invent_total():
+    usage = nanogpt.extract_token_usage({"usage": {"prompt_tokens": 5}})
+    assert usage.input == 5
+    assert usage.output is None
+    assert usage.total is None
+
+
+def test_derived_metrics_and_message_stats():
+    usage = nanogpt.TokenUsage(input=200, output=100, cache_read=50)
+    tps, hit = gw._derived_metrics(usage, 2000)
+    assert tps == 50.0
+    assert hit == 0.25
+    assert gw._derived_metrics(usage, 0) == (None, 0.25)
+    assert gw._derived_metrics(nanogpt.TokenUsage(input=0, cache_read=0), 1000) == (None, None)
+
+    messages = [
+        {"role": "system", "content": "s"},
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": [{"type": "text", "text": "ignored"}]},
+        {"role": "user", "content": "hi"},
+    ]
+    count, chars, roles = gw._message_stats(messages)
+    assert count == 4
+    assert chars == 8  # только str content, без текста вложений
+    assert roles == "system:1,user:2,assistant:1"
+
+
+def test_info_has_two_lines_and_debug_is_separate(fake, caplog):
+    caplog.set_level(logging.INFO, logger="gateway")
+    r = _chat(
+        model=TEST_MODEL,
+        messages=[{"role": "user", "content": "hello"}],
+        stream=False,
+    )
+    assert r.status_code == 200
+    lines = [l for l in caplog.messages if l.startswith(("chat ", "tokens "))]
+    assert len(lines) == 2
+    assert lines[0].startswith("chat gateway_id=")
+    assert lines[1].startswith("tokens gateway_id=")
+    gateway_id = r.headers["x-request-id"]
+    assert f"gateway_id={gateway_id}" in lines[0]
+    assert f"gateway_id={gateway_id}" in lines[1]
+    assert "in=5 out=3" in lines[1]
+    assert "cost=0.000001 currency=USD cost_seen=1 usage_seen=1" in lines[1]
+    # SSE-жир не попадает в INFO
+    assert "delta_keys" not in caplog.text
+    assert "sse_event_types" not in caplog.text
+    assert "events=" not in caplog.text
+
+
+def test_info_debug_retains_sse_diagnostics(fake, caplog):
+    caplog.set_level(logging.DEBUG, logger="gateway")
+    r = _chat(
+        model=TEST_MODEL,
+        messages=[{"role": "user", "content": "hello"}],
+        stream=False,
+    )
+    assert r.status_code == 200
+    debug_line = [l for l in caplog.messages if l.startswith("chat_debug ")][-1]
+    assert "upstream_fields=" in debug_line
+    assert "extra_fields=" in debug_line
+    assert "error_detail=" in debug_line
+
+
+def test_request_log_enriched_tokens_cost_but_no_prompt(fake, tmp_path):
+    prompt = "TOP_SECRET_PROMPT_SPEC009"
+    r = _chat(
+        model=TEST_MODEL,
+        messages=[
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": prompt},
+            {"role": "assistant", "content": "ok"},
+        ],
+    )
+    assert r.status_code == 200
+    rec = json.loads((tmp_path / "request_log.jsonl").read_text().strip().splitlines()[-1])
+    assert rec["status"] == "succeeded"
+    assert rec["input"] == 5
+    assert rec["output"] == 3
+    assert rec["total"] == 8
+    assert rec["upstream_cost"] == "0.000001"
+    assert rec["currency"] == "USD"
+    assert rec["cost_seen"] is True
+    assert rec["usage_seen"] is True
+    assert rec["messages_count"] == 3
+    assert rec["messages_chars"] == 3 + len(prompt) + 2
+    assert rec["roles"] == "system:1,user:1,assistant:1"
+    assert "ttft_ms" in rec  # sync без SSE-событий может быть null
+    assert "duration_ms" in rec
+    assert prompt not in json.dumps(rec)
+    assert "x_nanogpt_pricing" not in json.dumps(rec)
+
+
+def test_missing_usage_and_cost_unknown_explicit(fake, caplog, tmp_path):
+    caplog.set_level(logging.INFO, logger="gateway")
+    fake.mode = "sync_nothing"
+    r = _chat(model=TEST_MODEL, messages=[{"role": "user", "content": "hi"}])
+    assert r.status_code == 200
+    line = [l for l in caplog.messages if l.startswith("tokens ")][-1]
+    assert "usage=missing" in line
+    assert "cost=unknown" in line
+    assert "cost_seen=0" in line
+    rec = json.loads((tmp_path / "request_log.jsonl").read_text().strip().splitlines()[-1])
+    assert rec["usage_seen"] is False
+    assert rec["cost_seen"] is False
+    assert rec["upstream_cost"] is None
+    assert rec["input"] is None

@@ -16,6 +16,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
 from typing import Any, AsyncIterator
 
 import httpx
@@ -56,6 +57,27 @@ class UpstreamError(Exception):
 
 
 @dataclass
+class TokenUsage:
+    """Нормализованный наблюдаемый usage/cost upstream (SPEC_009 §5.1).
+
+    cost — decimal-строка только для лога/JSONL, не источник финансовой истины.
+    """
+
+    input: int | None = None
+    output: int | None = None
+    cache_read: int | None = None
+    cache_write: int | None = None
+    reasoning: int | None = None
+    total: int | None = None
+    upstream_cost: str | None = None
+    currency: str | None = None
+    usage_seen: bool = False
+    cost_seen: bool = False
+    # приоритет источника cost: 0 нет, 1 usdCost, 2 amount, 3 usage.cost
+    cost_rank: int = 0
+
+
+@dataclass
 class UpstreamMeta:
     """Безопасные метаданные вызова для логов и будущей сверки."""
 
@@ -63,6 +85,7 @@ class UpstreamMeta:
     upstream_request_id: str | None = None
     billing_lookup_id: str | None = None
     usage_seen: bool = False
+    token_usage: TokenUsage = field(default_factory=TokenUsage)
     upstream_status: int | None = None
     duration_ms: int = 0
     response_open_ms: int | None = None
@@ -129,6 +152,120 @@ def _classify(exc: Exception) -> UpstreamError:
     return UpstreamError("protocol", detail=type(exc).__name__)
 
 
+def _as_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, str) and value.strip().lstrip("-").isdigit():
+        return int(value.strip())
+    return None
+
+
+def _first_int(*values: Any) -> int | None:
+    for value in values:
+        parsed = _as_int(value)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _as_cost(value: Any) -> str | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return None
+    try:
+        parsed = Decimal(str(value))
+    except InvalidOperation:
+        return None
+    if not parsed.is_finite():
+        return None
+    # decimal-строка без float-потери; для лога и JSONL, не ledger
+    return format(parsed, "f")
+
+
+def _as_currency(value: Any) -> str | None:
+    if isinstance(value, str) and value.strip():
+        return value.strip()[:16]
+    return None
+
+
+def extract_token_usage(body: dict[str, Any]) -> TokenUsage:
+    """Маппит известные ключи usage/pricing в нормализованную структуру.
+
+    Приоритет cost зафиксирован: usage.cost → pricing.amount → pricing.costUsd/
+    usdCost. Отсутствующие значения остаются None; счётчики не суммируются
+    вслепую (reasoning может быть подмножеством output).
+    """
+    usage = body.get("usage")
+    usage = usage if isinstance(usage, dict) else {}
+    pricing = body.get("x_nanogpt_pricing")
+    pricing = pricing if isinstance(pricing, dict) else {}
+    prompt_details = usage.get("prompt_tokens_details")
+    prompt_details = prompt_details if isinstance(prompt_details, dict) else {}
+    completion_details = usage.get("completion_tokens_details")
+    completion_details = completion_details if isinstance(completion_details, dict) else {}
+
+    out = TokenUsage(usage_seen=isinstance(body.get("usage"), dict))
+    out.input = _first_int(usage.get("prompt_tokens"), pricing.get("inputTokens"))
+    out.output = _first_int(usage.get("completion_tokens"), pricing.get("outputTokens"))
+    out.cache_read = _first_int(
+        prompt_details.get("cached_tokens"),
+        usage.get("cached_tokens"),
+        pricing.get("cacheReadInputTokens"),
+    )
+    out.cache_write = _first_int(
+        usage.get("cache_write_tokens"),
+        prompt_details.get("cache_write_tokens"),
+        pricing.get("cacheWriteInputTokens"),
+    )
+    out.reasoning = _first_int(
+        usage.get("reasoning_tokens"),
+        completion_details.get("reasoning_tokens"),
+        prompt_details.get("reasoning_tokens"),
+        pricing.get("reasoningTokens"),
+    )
+    out.total = _first_int(usage.get("total_tokens"))
+    if out.total is None and out.input is not None and out.output is not None:
+        out.total = out.input + out.output
+
+    cost = _as_cost(usage.get("cost"))
+    if cost is not None:
+        out.upstream_cost = cost
+        out.currency = _as_currency(usage.get("currency")) or _as_currency(pricing.get("currency"))
+        out.cost_rank = 3
+    else:
+        cost = _as_cost(pricing.get("amount"))
+        if cost is not None:
+            out.upstream_cost = cost
+            out.currency = _as_currency(pricing.get("currency"))
+            out.cost_rank = 2
+        else:
+            cost = _as_cost(pricing.get("costUsd"))
+            if cost is None:
+                cost = _as_cost(pricing.get("usdCost"))
+            if cost is not None:
+                out.upstream_cost = cost
+                out.currency = "USD"
+                out.cost_rank = 1
+    out.cost_seen = out.upstream_cost is not None
+    return out
+
+
+def merge_token_usage(target: TokenUsage, parsed: TokenUsage) -> None:
+    # stream приходит несколькими чанками: не затирать уже известные поля
+    for name in ("input", "output", "cache_read", "cache_write", "reasoning", "total"):
+        if getattr(target, name) is None:
+            setattr(target, name, getattr(parsed, name))
+    if parsed.cost_rank > target.cost_rank:
+        target.upstream_cost = parsed.upstream_cost
+        target.currency = parsed.currency
+        target.cost_rank = parsed.cost_rank
+    target.usage_seen = target.usage_seen or parsed.usage_seen
+    target.cost_seen = target.upstream_cost is not None
+
+
 def _collect_json_ids(body: dict[str, Any], headers: httpx.Headers, meta: UpstreamMeta) -> None:
     if isinstance(body.get("id"), str):
         meta.response_id = body["id"]
@@ -144,6 +281,7 @@ def _collect_json_ids(body: dict[str, Any], headers: httpx.Headers, meta: Upstre
         meta.billing_lookup_id = rid
     if isinstance(body.get("usage"), dict):
         meta.usage_seen = True
+    merge_token_usage(meta.token_usage, extract_token_usage(body))
 
 
 def _strip_pricing(body: dict[str, Any]) -> dict[str, Any]:
