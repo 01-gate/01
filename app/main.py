@@ -142,7 +142,6 @@ async def chat_completions(request: Request):
     messages = payload.get("messages")
     stream = payload.get("stream", False)
     stream_options = payload.get("stream_options", {})
-    #print(payload)
 
     def bad_request(code: str, message: str) -> JSONResponse:
         log_chat(
@@ -164,10 +163,10 @@ async def chat_completions(request: Request):
     if not isinstance(stream_options, dict):
         return bad_request("invalid_request_error", "Invalid `stream_options` field")
 
-    if model not in MODEL_UPSTREAM:
-        # каталог и маппинг обязаны совпадать; atomic-проверка до вызова upstream
-        logger.info(
-            "chat method=POST path=/v1/chat/completions status=404 auth_present=%s auth_ok=True model=%s stream=%s upstream_call=False",
+    if model not in MODEL_CATALOG:
+        # каталог и accept-list обязаны совпадать; atomic-проверка до вызова upstream
+        log_chat(
+            "status=404 auth_present=%s auth_ok=True model=%s stream=%s upstream_call=False",
             auth_present,
             model,
             stream,
