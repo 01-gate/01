@@ -93,7 +93,7 @@ def _client() -> httpx.AsyncClient:
 
 
 def _upstream_headers() -> dict[str, str]:
-    return {"Authorization": f"Bearer {os.environ['NANOGPT_API_KEY']}"}
+    return {"x-api-key": os.environ['NANOGPT_API_KEY']}
 
 
 def _build_payload(

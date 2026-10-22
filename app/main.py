@@ -16,12 +16,29 @@ MAX_BODY_BYTES = 1_048_576
 
 # Публичный allowlist каталога (SPEC_004 §4.1): только контрактные поля,
 # upstream-идентификаторы в HTTP-ответ не попадают.
+# TODO в отдельное файло
+# deepseek/deepseek-v4.1-flash-1017:thinking потестить и другие:thinking
+# попробовать написать свой тест вот как раз типа: стишок -> html -> солнышко -> травка -> облачка -> птички -> дождик (ваще никакие технологии не упоминать)
+# [mimo-v2.6-flash, deepseek-v4.1-flash, glm-5.3-flash, muse-spark-1.3-contributor, qwen3.8-flash, minimax-m3.1-flash, hy3, gpt-6-luna, claude-haiku-5.5, gpt-6-luna-pro, deepseek-v4.1-flash-1017]
+
 PUBLIC_MODELS = {
-    "01": {"id": "01", "object": "model", "created": 1729500000, "owned_by": "local"},
+    1: {"id": "mimo"},
+    2: {"id": "deepseek"},
+    3: {"id": "deepseek-last"},
 }
 # Публичный id -> точный upstream ID из подтверждённого каталога NanoGPT.
 MODEL_UPSTREAM = {
-    "01": "xiaomi/mimo-v2.6-flash",
+    "mimo": "xiaomi/mimo-v2.6-flash",
+    "deepseek": "deepseek/deepseek-v4.1-flash",
+    "glm": "z-ai/glm-5.3-flash",
+    "spark": "meta/muse-spark-1.3-contributor",
+    "qwen": "qwen/qwen3.8-flash",
+    "minimax": "minimax/minimax-m3.1-flash", #Input $0.15/1M Output $0.60/1M Read $0.02/1M
+    "hy3": "tencent/hy3", #Input $0.07/1M Output $0.26/1M Read $0.03/1M
+    "luna": "openai/gpt-luna-latest", #Input $0.10/1M Output 0.50/1M Read $0.01/1M Write $0.13/1M
+    "haiku": "anthropic/claude-haiku-latest", #Input $0.10/1M Output$0.50/1M Read $0.01/1M Write $0.13/1M
+    "luna-pro": "openai/gpt-6-luna-pro", #Input $0.10/1M Output 0.50/1M Read $0.01/1M Write $0.13/1M
+    "deepseek-last": "deepseek/deepseek-v4-flash-latest", #Input$0.30/1M Output$1.20/1M Read $0.0060/1M
 }
 
 logger = logging.getLogger("gateway")
@@ -142,6 +159,7 @@ async def chat_completions(request: Request):
     messages = payload.get("messages")
     stream = payload.get("stream", False)
     stream_options = payload.get("stream_options", {})
+    #print(payload)
 
     def bad_request(code: str, message: str) -> JSONResponse:
         logger.info(
@@ -163,7 +181,7 @@ async def chat_completions(request: Request):
     if not isinstance(stream_options, dict):
         return bad_request("invalid_request_error", "Invalid `stream_options` field")
 
-    if model not in PUBLIC_MODELS or model not in MODEL_UPSTREAM:
+    if model not in MODEL_UPSTREAM:
         # каталог и маппинг обязаны совпадать; atomic-проверка до вызова upstream
         logger.info(
             "chat method=POST path=/v1/chat/completions status=404 auth_present=%s auth_ok=True model=%s stream=%s upstream_call=False",
