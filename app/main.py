@@ -299,6 +299,9 @@ async def _run_chat(
             )
 
         try:
+            # заявка на сверку живёт ДО ожидания upstream: если процесс упадёт
+            # во время генерации, запись с gateway_request_id уже на диске
+            record("upstream_inflight", meta.usage_seen, None)
             result = await nanogpt.run_chat(upstream_model, messages, stream, include_usage, extra, meta)
         except nanogpt.UpstreamError as err:
             log_chat(nano_log, *base_args, *meta_args("504" if err.kind == "timeout" else "502", err.kind))
@@ -312,6 +315,10 @@ async def _run_chat(
             if meta.upstream_request_id:
                 headers["X-Upstream-Request-ID"] = meta.upstream_request_id
             return JSONResponse(result, headers=headers)
+
+        # upstream уже ответил: id известны, фиксируем их в заявке на сверку
+        # до того, как стрим начнёт отдавать данные клиенту
+        record("upstream_inflight", meta.usage_seen, None)
 
         async def sse_nano() -> Any:
             error: str | None = None

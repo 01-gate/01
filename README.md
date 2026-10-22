@@ -14,7 +14,7 @@
 - Usage сохраняется в ответе, если upstream его возвращает. Внутреннее поле `x_nanogpt_pricing` в клиентский ответ не передаётся.
 - Простые in-process лимиты: max concurrent chat-запросов и optional окно частоты. Превышение возвращает OpenAI-compatible `429 rate_limit_exceeded` до вызова upstream.
 - Автоматических повторов генерации нет. Если соединение оборвалось после начала запроса, исход может остаться неизвестным; smoke test не запускает повтор автоматически.
-- Каждый chat-запрос получает статус (`succeeded`, `upstream_error`, `unknown_outcome`, `client_disconnected`, `needs_reconciliation`) и пишется одной строкой JSONL в `data/request_log.jsonl` (путь переопределяется `GATEWAY_REQUEST_LOG_PATH`). В файл попадают только id, модель, статус, `usage_seen` и timestamps — не секреты и не содержимое запроса.
+- Каждый chat-запрос получает статус (`upstream_inflight` — до ожидания upstream, далее `succeeded`, `upstream_error`, `unknown_outcome`, `client_disconnected`, `needs_reconciliation`) и пишется строками JSONL в `data/request_log.jsonl` (путь переопределяется `GATEWAY_REQUEST_LOG_PATH`). Строка `upstream_inflight` пишется до вызова NanoGPT, поэтому авария процесса во время генерации не оставляет запрос без следа. В файл попадают только id, модель, статус, `usage_seen` и timestamps — не секреты и не содержимое запроса.
 
 В этом срезе нет биллинга gateway, PostgreSQL, балансов, резервов, Usage API или Request Billing API.
 

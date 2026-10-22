@@ -963,8 +963,24 @@ def test_stream_error_after_start_ends_without_fake_done(monkeypatch, caplog, tm
     assert rec["usage_seen"] is False
 
 
-def test_stream_normal_final_log_separates_states(fake, caplog, tmp_path):
-    # SPEC_006 §2/§3: штатный поток — успех отличим от ошибки, статусы разделены
+def test_upstream_inflight_recorded_before_awaiting_upstream(fake, monkeypatch, tmp_path):
+    # запись должна существовать до окончания генерации: иначе падение процесса
+    # во время вызова upstream оставит запрос без следа (SPEC_008 §5 шаг 7)
+    seen: list[str] = []
+    real_run_chat = nanogpt.run_chat
+
+    async def spy(*args, **kwargs):
+        seen.extend((tmp_path / "request_log.jsonl").read_text().splitlines())
+        return await real_run_chat(*args, **kwargs)
+
+    monkeypatch.setattr(nanogpt, "run_chat", spy)
+    r = _chat(model=TEST_MODEL, messages=[{"role": "user", "content": "hi"}])
+    assert r.status_code == 200
+    assert seen, "upstream_inflight отсутствовал до вызова upstream"
+    assert json.loads(seen[-1])["status"] == "upstream_inflight"
+
+
+def test_stream_normal_final_log_separates_states(fake, caplog, tmp_path):    # SPEC_006 §2/§3: штатный поток — успех отличим от ошибки, статусы разделены
     caplog.set_level(logging.INFO, logger="gateway")
     got = _first_stream_data()
     assert got[-1][1] == "[DONE]"
