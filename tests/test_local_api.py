@@ -240,6 +240,32 @@ def test_missing_messages():
     assert r.json()["error"]["code"] == "invalid_messages"
 
 
+def test_text_part_content_accepted():
+    for content in (
+        {"type": "text", "text": "hi"},
+        [{"type": "text", "text": "hi"}],
+    ):
+        r = _chat(model=TEST_MODEL, messages=[{"role": "user", "content": content}])
+        assert r.status_code == 200, r.text
+
+
+def test_multimodal_content_rejected():
+    r = _chat(
+        model=TEST_MODEL,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "what is this?"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,xx"}},
+                ],
+            }
+        ],
+    )
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "invalid_messages"
+
+
 def test_body_too_large():
     r = _chat(model=TEST_MODEL, messages=[{"role": "user", "content": "x" * (1_048_576 + 1)}])
     assert r.status_code == 413
