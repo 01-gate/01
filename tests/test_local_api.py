@@ -85,7 +85,7 @@ def test_models_ok():
 def test_catalog_is_single_source_of_truth():
     # SPEC_008 §5 шаг 1: GET /v1/models и accept-list chat — одно множество ID
     r = request("GET", "/v1/models")
-    assert [m["id"] for m in r.json()["data"]] == list(MODEL_CATALOG)
+    assert [m["id"] for m in r.json()["data"]] == [m["id"] for m in MODEL_CATALOG]
 
 
 def test_old_public_model_01_rejected():
