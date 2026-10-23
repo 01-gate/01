@@ -329,6 +329,39 @@ def test_forwarded_parameters_are_explicit_and_reasoning_effort_is_forwarded(fak
     }
 
 
+@pytest.mark.parametrize("field", nanogpt.MAX_FIELDS)
+def test_max_token_fields_below_cap_forwarded_unchanged(fake, field):
+    r = _chat(
+        model=TEST_MODEL,
+        messages=[{"role": "user", "content": "hi"}],
+        **{field: 123},
+    )
+    assert r.status_code == 200
+    assert fake.requests[-1]["payload"][field] == 123
+
+
+@pytest.mark.parametrize("field", nanogpt.MAX_FIELDS)
+def test_max_token_fields_clamped_to_cap(fake, field):
+    r = _chat(
+        model=TEST_MODEL,
+        messages=[{"role": "user", "content": "hi"}],
+        **{field: nanogpt.MAX_TOKENS + 1},
+    )
+    assert r.status_code == 200
+    assert fake.requests[-1]["payload"][field] == nanogpt.MAX_TOKENS
+
+
+@pytest.mark.parametrize("field", nanogpt.MAX_FIELDS)
+def test_max_token_fields_at_cap_forwarded_unchanged(fake, field):
+    r = _chat(
+        model=TEST_MODEL,
+        messages=[{"role": "user", "content": "hi"}],
+        **{field: nanogpt.MAX_TOKENS},
+    )
+    assert r.status_code == 200
+    assert fake.requests[-1]["payload"][field] == nanogpt.MAX_TOKENS
+
+
 def test_tool_calling_fields_forwarded_to_upstream(fake):
     tools = [
         {
