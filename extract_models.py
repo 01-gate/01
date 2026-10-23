@@ -132,6 +132,8 @@ def main():
             "id": upstream,
             **{f: src.get(f) for f in FIELDS},
         })
+        old_result["context_length"] = 250000
+        old_result["max_output_tokens"] = 12500
 
     # Пишем в текущую рабочую директорию (откуда запустили скрипт)
     models_path = Path("models.json")
