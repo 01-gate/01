@@ -10,7 +10,7 @@ import pytest
 
 from app import config, limits
 from app import main as gw
-from app.models_catalog import MODEL_CATALOG
+from app.models_catalog import MODEL_UPSTREAM
 from app.upstream import nanogpt
 
 GATEWAY_KEY = "test-gateway-key-123"
@@ -18,7 +18,7 @@ NANO_KEY = "sk-nano-test-upstream"
 AUTH = {"Authorization": f"Bearer {GATEWAY_KEY}"}
 NANO_BASE = "https://api.nano-gpt.com/v1"
 TEST_MODEL = config.test_model()
-TEST_UPSTREAM_MODEL = MODEL_CATALOG[TEST_MODEL]
+TEST_UPSTREAM_MODEL = MODEL_UPSTREAM[TEST_MODEL]
 
 SYNC_BODY = {
     "id": "chatcmpl-up-1",
@@ -526,11 +526,11 @@ def test_unknown_model_never_calls_upstream(fake):
 def test_only_catalog_keys_are_accepted(fake):
     # SPEC_008 §5 шаг 1: accept-list chat атомарен каталогу; прежние лишние ключи
     # (например luna) и upstream ID как публичный ID не принимаются
-    for bad in ("luna", TEST_UPSTREAM_MODEL, "01"):
+    for bad in ("nope", TEST_UPSTREAM_MODEL, "01"):
         r = _chat(model=bad, messages=[{"role": "user", "content": "hi"}])
         assert r.status_code == 404, bad
     assert fake.requests == []
-    assert TEST_MODEL in MODEL_CATALOG
+    assert TEST_MODEL in MODEL_UPSTREAM
 
 
 def test_concurrency_limit_rejects_before_upstream(fake, monkeypatch):

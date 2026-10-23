@@ -7,20 +7,16 @@ import os
 import time
 import uuid
 from typing import Any
+from pathlib import Path
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from app import config, limits, request_log
-from app.models_catalog import MODEL_CATALOG
+from app.models_catalog import MODEL_CATALOG, MODEL_UPSTREAM
 from app.upstream import nanogpt, stub
 
 MAX_BODY_BYTES = 1_048_576
-
-# Публичный каталог строится из единого источника правды (SPEC_008 §5 шаг 1):
-# ключи MODEL_CATALOG и есть публичные ID; upstream-идентификаторы в HTTP-ответ
-# не попадают. Цены и TODO сюда не входят — это не runtime-контракт этапа.
-PUBLIC_MODELS = {index: {"id": model_id} for index, model_id in enumerate(MODEL_CATALOG, start=1)}
 
 logger = logging.getLogger("gateway")
 if not logger.handlers:
@@ -34,6 +30,26 @@ try:
 except config.ConfigError as exc:
     logger.critical("%s", exc)
     raise SystemExit(2) from None
+
+_MODELS_JSON = Path(__file__).resolve().parent.parent / "models.json"
+try:
+    with _MODELS_JSON.open(encoding="utf-8") as f:
+        _DETAIL = {m["id"]: m for m in json.load(f)}
+except FileNotFoundError:
+    logger.critical("models.json not found: %s (run extract_models.py)", _MODELS_JSON)
+    raise SystemExit(2) from None
+
+# Публичный каталог: id/name/description из MODEL_CATALOG + детали из models.json.
+# models.json ключуется upstream-идом, поэтому наружу он уходит только в слиянии.
+MODELS_DATA: list[dict] = [
+    {
+        "id": entry["id"],
+        "name": entry["name"],
+        "description": entry["description"],
+        **{k: v for k, v in _DETAIL.get(entry["url"], {}).items() if k != "id"},
+    }
+    for entry in MODEL_CATALOG
+]
 
 app = FastAPI()
 
@@ -244,7 +260,7 @@ async def health(request: Request):
 @app.get("/v1/models")
 async def list_models():
     # публичный endpoint: авторизации нет по решению (§2.4, §4.1)
-    return JSONResponse({"object": "list", "data": list(PUBLIC_MODELS.values())})
+    return JSONResponse({"object": "list", "data": MODELS_DATA})
 
 
 @app.post("/v1/chat/completions")
@@ -310,7 +326,7 @@ async def chat_completions(request: Request):
     if not isinstance(stream_options, dict):
         return bad_request("invalid_request_error", "Invalid `stream_options` field")
 
-    if model not in MODEL_CATALOG:
+    if model not in MODEL_UPSTREAM:
         # каталог и accept-list обязаны совпадать; atomic-проверка до вызова upstream
         log_chat(
             "status=404 auth_present=%s auth_ok=True model=%s stream=%s upstream_call=False",
@@ -323,7 +339,7 @@ async def chat_completions(request: Request):
     include_usage = bool(stream_options.get("include_usage", False))
     extra_fields = sorted(set(payload) - {"model", "messages", "stream", "stream_options"})
     extra = {k: payload[k] for k in extra_fields}
-    upstream_model = MODEL_CATALOG[model]
+    upstream_model = MODEL_UPSTREAM[model]
 
     # basic лимиты проверяются ДО вызова upstream (SPEC_008 §5 шаг 6)
     if not limits.try_acquire():

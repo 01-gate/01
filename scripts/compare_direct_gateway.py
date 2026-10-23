@@ -23,7 +23,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from app import config  # noqa: E402
-from app.models_catalog import MODEL_CATALOG  # noqa: E402
+from app.models_catalog import MODEL_UPSTREAM  # noqa: E402
 
 DEFAULT_NANOGPT_BASE = "https://nano-gpt.com/api/v1"
 DEFAULT_GATEWAY_BASE = "http://127.0.0.1:8000/v1"
@@ -51,7 +51,7 @@ def gateway_model() -> str:
 
 
 def upstream_model() -> str:
-    return MODEL_CATALOG[config.test_model()]
+    return MODEL_UPSTREAM[config.test_model()]
 
 
 def prepare_payload(path: Path) -> dict[str, Any]:
