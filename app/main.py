@@ -122,6 +122,39 @@ def _message_stats(messages: list[Any]) -> tuple[int, int, str]:
     return len(messages), chars, roles
 
 
+def _is_text_part(part: Any) -> bool:
+    return (
+        isinstance(part, dict)
+        and part.get("type") == "text"
+        and isinstance(part.get("text"), str)
+    )
+
+
+def _messages_content_is_text_only(messages: list[Any]) -> bool:
+    """Allow only text content, reject multimodal parts.
+
+    Allowed per message: plain string, a single text part, or a list of text
+    parts (standard OpenAI shape). ``content`` may also be null/absent (assistant
+    tool-call messages). Anything else (image_url, input_audio, video_url, ...)
+    is rejected.
+    """
+    for message in messages:
+        if not isinstance(message, dict):
+            return False
+
+        content = message.get("content")
+
+        if content is None or isinstance(content, str):
+            continue
+        if _is_text_part(content):
+            continue
+        if isinstance(content, list) and all(_is_text_part(p) for p in content):
+            continue
+        return False
+
+    return True
+
+
 def _fmt(value: Any) -> str:
     return "-" if value is None else str(value)
 
@@ -321,6 +354,9 @@ async def chat_completions(request: Request):
         return bad_request("invalid_messages", "Invalid `messages` field")
     if not all(isinstance(m, dict) and isinstance(m.get("role"), str) for m in messages):
         return bad_request("invalid_messages", "Invalid `messages` field")
+    if not _messages_content_is_text_only(messages):
+        # only text content is allowed; no multimodal parts
+        return bad_request("invalid_messages", "Message content must be text")
     if not isinstance(stream, bool):
         return bad_request("invalid_request_error", "Invalid `stream` field")
     if not isinstance(stream_options, dict):
