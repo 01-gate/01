@@ -23,6 +23,8 @@ import httpx
 
 logger = logging.getLogger("gateway.upstream")
 
+MAX_TOKENS=10000
+
 # Поля публичного Chat Completions, пробрасываемые в NanoGPT. Всё остальное
 # отбрасывается: умолчания upstream, инструкции (§5.2 «только нужные поля»).
 FORWARD_FIELDS = (
@@ -34,8 +36,6 @@ FORWARD_FIELDS = (
     "parallel_tool_calls",
     "temperature",
     "top_p",
-    "max_tokens",
-    "max_completion_tokens",
     "stop",
     "presence_penalty",
     "frequency_penalty",
@@ -44,6 +44,8 @@ FORWARD_FIELDS = (
     "logprobs",
     "top_logprobs",
 )
+
+MAX_FIELDS = ("max_tokens", "max_completion_tokens", "max_output_tokens")
 
 
 class UpstreamError(Exception):
@@ -133,11 +135,16 @@ def _build_payload(
         payload["stream"] = True
         if include_usage:
             payload.setdefault("stream_options", {})["include_usage"] = True
+
+    for key in MAX_FIELDS:
+        if key in extra:
+            value = extra[key]
+            payload[key] = value if value < MAX_TOKENS else MAX_TOKENS
+
     for name in FORWARD_FIELDS:
         if name in extra:
             payload[name] = extra[name]
     return payload
-
 
 def _classify(exc: Exception) -> UpstreamError:
     # ConnectTimeout — таймаут, а не ошибка соединения: 504, не 502 (SPEC_005 §4.4)
